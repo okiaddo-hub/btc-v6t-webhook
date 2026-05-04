@@ -8,6 +8,7 @@ import hashlib
 import urllib.parse
 import urllib.request
 import urllib.error
+import uuid
 
 app = FastAPI()
 
@@ -18,9 +19,16 @@ MEXC_ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
 
-# MEXC futures contract symbols usually use underscore format, e.g. BTC_USDT.
+# MEXC futures settings
 MEXC_CONTRACT_SYMBOL = os.getenv("MEXC_CONTRACT_SYMBOL", "BTC_USDT")
 MEXC_CONTRACT_BASE_URL = "https://contract.mexc.com"
+
+# Execution assumptions.
+# IMPORTANT: verify MEXC `vol` unit before enabling live execution.
+MEXC_LEVERAGE = int(os.getenv("MEXC_LEVERAGE", "4"))
+MEXC_OPEN_TYPE = int(os.getenv("MEXC_OPEN_TYPE", "1"))  # 1 isolated, 2 cross
+MEXC_ORDER_TYPE = int(os.getenv("MEXC_ORDER_TYPE", "5"))  # 5 market order
+MEXC_POSITION_MODE = int(os.getenv("MEXC_POSITION_MODE", "2"))  # 2 one-way; confirm on your account
 
 ALLOWED_ACTIONS = {
     "LONG_ENTRY",
@@ -66,16 +74,19 @@ def utc_now():
 
 
 def clean_action(action: str) -> str:
-    """
-    Converts TEST_LONG_ENTRY -> LONG_ENTRY.
-    Real actions are unchanged.
-    """
     if isinstance(action, str) and action.startswith("TEST_"):
         return action.replace("TEST_", "", 1)
     return action
 
 
-def has_open_mexc_position(mexc_result: dict) -> tuple[bool, str]:
+def to_float(value, field_name: str):
+    try:
+        return float(value)
+    except Exception:
+        raise ValueError(f"{field_name} must be numeric, got {value}")
+
+
+def has_open_mexc_position(mexc_result: dict):
     """
     Interprets MEXC open position response.
 
@@ -100,15 +111,12 @@ def has_open_mexc_position(mexc_result: dict) -> tuple[bool, str]:
     if not isinstance(positions, list):
         return False, f"Unexpected MEXC positions format: {positions}"
 
-    # If MEXC returns any open position for the queried symbol, treat it as occupied.
     open_positions = []
 
     for pos in positions:
         if not isinstance(pos, dict):
             continue
 
-        # MEXC position fields can vary, so we are conservative.
-        # If there is a returned object for the symbol, assume position exists unless clearly zero.
         hold_vol = pos.get("holdVol", pos.get("hold_vol", pos.get("volume", None)))
         state = pos.get("state", None)
 
@@ -131,17 +139,24 @@ def has_open_mexc_position(mexc_result: dict) -> tuple[bool, str]:
 
 
 # =====================================================
-# MEXC read-only helpers
+# MEXC request helpers
 # =====================================================
 
-def mexc_get_private(path: str, params: dict | None = None):
+def mexc_sign(payload: str, request_time: str):
     """
-    Sends signed GET request to MEXC Contract API.
+    MEXC contract private signature:
+    accessKey + timestamp + query/body string
+    """
+    signature_payload = MEXC_ACCESS_KEY + request_time + payload
 
-    Signing rule for private GET:
-    signature payload = accessKey + timestamp + sorted_query_string
-    signature = HMAC_SHA256(secret, payload)
-    """
+    return hmac.new(
+        MEXC_SECRET_KEY.encode("utf-8"),
+        signature_payload.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def mexc_get_private(path: str, params=None):
     if not MEXC_ACCESS_KEY or not MEXC_SECRET_KEY:
         return {
             "ok": False,
@@ -149,24 +164,15 @@ def mexc_get_private(path: str, params: dict | None = None):
         }
 
     params = params or {}
-
-    # Remove None values so they do not participate in signature.
     clean_params = {
         k: v for k, v in params.items()
         if v is not None and v != ""
     }
 
-    # MEXC GET params are sorted and joined with &.
     query_string = urllib.parse.urlencode(sorted(clean_params.items()))
 
     request_time = str(int(time.time() * 1000))
-    signature_payload = MEXC_ACCESS_KEY + request_time + query_string
-
-    signature = hmac.new(
-        MEXC_SECRET_KEY.encode("utf-8"),
-        signature_payload.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+    signature = mexc_sign(query_string, request_time)
 
     url = MEXC_CONTRACT_BASE_URL + path
     if query_string:
@@ -211,7 +217,71 @@ def mexc_get_private(path: str, params: dict | None = None):
         }
 
 
-def get_mexc_open_positions(symbol: str | None = None):
+def mexc_post_private(path: str, body: dict):
+    """
+    Signed POST request to MEXC Contract API.
+
+    This function can place live orders if called while using order permissions.
+    We only call it when LIVE_TRADING_ENABLED=true.
+    """
+    if not MEXC_ACCESS_KEY or not MEXC_SECRET_KEY:
+        return {
+            "ok": False,
+            "error": "MEXC_ACCESS_KEY or MEXC_SECRET_KEY missing in Render environment variables",
+        }
+
+    body_string = json.dumps(body, separators=(",", ":"))
+
+    request_time = str(int(time.time() * 1000))
+    signature = mexc_sign(body_string, request_time)
+
+    url = MEXC_CONTRACT_BASE_URL + path
+
+    headers = {
+        "ApiKey": MEXC_ACCESS_KEY,
+        "Request-Time": request_time,
+        "Signature": signature,
+        "Content-Type": "application/json",
+        "Recv-Window": "30000",
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=body_string.encode("utf-8"),
+        headers=headers,
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            raw = response.read().decode("utf-8")
+            return {
+                "ok": True,
+                "status_code": response.status,
+                "data": json.loads(raw),
+            }
+
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = raw
+
+        return {
+            "ok": False,
+            "status_code": e.code,
+            "error": parsed,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
+def get_mexc_open_positions(symbol=None):
     params = {}
     if symbol:
         params["symbol"] = symbol
@@ -223,22 +293,91 @@ def get_mexc_open_positions(symbol: str | None = None):
 
 
 # =====================================================
+# Order dry-run / order payload builder
+# =====================================================
+
+def build_mexc_entry_order(payload: dict):
+    """
+    Builds the exact MEXC order body we would send for entry.
+
+    IMPORTANT:
+    This currently assumes TradingView qty can be used as MEXC vol.
+    Verify MEXC BTC_USDT contract volume unit before enabling live execution.
+    """
+    action = payload.get("action")
+    base_action = clean_action(action)
+
+    if base_action not in {"LONG_ENTRY", "SHORT_ENTRY"}:
+        raise ValueError(f"Cannot build entry order for non-entry action: {action}")
+
+    qty = to_float(payload.get("qty"), "qty")
+    stop = to_float(payload.get("stop"), "stop")
+    target = to_float(payload.get("target"), "target")
+
+    if qty <= 0:
+        raise ValueError(f"qty must be > 0, got {qty}")
+
+    if stop <= 0:
+        raise ValueError(f"stop must be > 0, got {stop}")
+
+    if target <= 0:
+        raise ValueError(f"target must be > 0, got {target}")
+
+    side = 1 if base_action == "LONG_ENTRY" else 3  # 1 open long, 3 open short
+
+    external_oid = "v6t_" + str(uuid.uuid4()).replace("-", "")[:24]
+
+    order_body = {
+        "symbol": MEXC_CONTRACT_SYMBOL,
+        "price": 0,
+        "vol": qty,
+        "leverage": MEXC_LEVERAGE,
+        "side": side,
+        "type": MEXC_ORDER_TYPE,
+        "openType": MEXC_OPEN_TYPE,
+        "externalOid": external_oid,
+        "stopLossPrice": stop,
+        "takeProfitPrice": target,
+        "positionMode": MEXC_POSITION_MODE,
+    }
+
+    return {
+        "order_body": order_body,
+        "warnings": [
+            "DRY RUN ONLY unless LIVE_TRADING_ENABLED=true.",
+            "Verify MEXC vol unit before live execution. Current assumption: TradingView qty == MEXC vol.",
+            "Verify MEXC account is isolated margin and one-way mode before live execution.",
+        ],
+    }
+
+
+def maybe_place_live_order(order_body: dict):
+    """
+    Places live order only if LIVE_TRADING_ENABLED=true.
+    Otherwise returns dry-run result.
+    """
+    if not LIVE_TRADING_ENABLED:
+        return {
+            "live_order_sent": False,
+            "reason": "dry run only - LIVE_TRADING_ENABLED=false",
+            "would_send_order": order_body,
+        }
+
+    return {
+        "live_order_sent": True,
+        "reason": "LIVE_TRADING_ENABLED=true - submitting order to MEXC",
+        "mexc_response": mexc_post_private(
+            "/api/v1/private/order/submit",
+            order_body
+        ),
+    }
+
+
+# =====================================================
 # Entry guard
 # =====================================================
 
-def run_entry_guard(payload: dict, is_test: bool, mexc_position_snapshot: dict | None = None):
-    """
-    Checks whether a future live entry would be allowed.
-
-    This does NOT place orders.
-
-    Guard rules:
-    - Reject TEST_ events.
-    - Only run for LONG_ENTRY / SHORT_ENTRY.
-    - Require paper state flat.
-    - Require MEXC no open BTC_USDT position.
-    - If LIVE_TRADING_ENABLED=false, report "would enter, but disabled".
-    """
+def run_entry_guard(payload: dict, is_test: bool, mexc_position_snapshot=None):
     action = payload.get("action")
     base_action = clean_action(action)
 
@@ -298,7 +437,6 @@ def run_entry_guard(payload: dict, is_test: bool, mexc_position_snapshot: dict |
         })
         return result
 
-    # Passed all safety checks.
     if not LIVE_TRADING_ENABLED:
         result.update({
             "guard_passed": True,
@@ -307,11 +445,10 @@ def run_entry_guard(payload: dict, is_test: bool, mexc_position_snapshot: dict |
         })
         return result
 
-    # Future live trading branch. We still do not place orders in this version.
     result.update({
         "guard_passed": True,
         "would_enter": True,
-        "reason": "guard passed and live trading enabled, but order placement is not implemented in this version",
+        "reason": "guard passed and live trading enabled",
     })
     return result
 
@@ -321,12 +458,6 @@ def run_entry_guard(payload: dict, is_test: bool, mexc_position_snapshot: dict |
 # =====================================================
 
 def process_paper_event(payload: dict, is_test: bool):
-    """
-    Simulates future execution logic without touching MEXC.
-
-    TEST_ events are ignored by paper trader.
-    Real events update paper state.
-    """
     action = payload.get("action")
     base_action = clean_action(action)
 
@@ -337,7 +468,6 @@ def process_paper_event(payload: dict, is_test: bool):
 
     paper_state["event_count"] += 1
 
-    # TEST events should never affect paper position.
     if is_test:
         paper_state["last_action"] = action
         paper_state["last_reason"] = "test event ignored by paper trader"
@@ -347,10 +477,6 @@ def process_paper_event(payload: dict, is_test: bool):
             "paper_reason": "test event ignored by paper trader",
             "paper_state": paper_state.copy(),
         }
-
-    # -------------------------
-    # ENTRY EVENTS
-    # -------------------------
 
     if base_action == "LONG_ENTRY":
         if paper_state["position"] != "flat":
@@ -408,10 +534,6 @@ def process_paper_event(payload: dict, is_test: bool):
             "paper_state": paper_state.copy(),
         }
 
-    # -------------------------
-    # TRAIL UPDATE EVENTS
-    # -------------------------
-
     if base_action == "LONG_TRAIL_UPDATE":
         if paper_state["position"] != "long":
             paper_state["last_action"] = action
@@ -425,7 +547,6 @@ def process_paper_event(payload: dict, is_test: bool):
 
         old_stop = paper_state["stop"]
 
-        # For long trades, stop should only move UP.
         if stop is None or old_stop is None or stop <= old_stop:
             paper_state["last_action"] = action
             paper_state["last_reason"] = f"rejected LONG_TRAIL_UPDATE because stop did not improve: old={old_stop}, new={stop}"
@@ -463,7 +584,6 @@ def process_paper_event(payload: dict, is_test: bool):
 
         old_stop = paper_state["stop"]
 
-        # For short trades, stop should only move DOWN.
         if stop is None or old_stop is None or stop >= old_stop:
             paper_state["last_action"] = action
             paper_state["last_reason"] = f"rejected SHORT_TRAIL_UPDATE because stop did not improve: old={old_stop}, new={stop}"
@@ -487,10 +607,6 @@ def process_paper_event(payload: dict, is_test: bool):
             "paper_reason": "paper short stop updated",
             "paper_state": paper_state.copy(),
         }
-
-    # -------------------------
-    # EXIT EVENTS
-    # -------------------------
 
     if base_action == "LONG_EXIT":
         if paper_state["position"] != "long":
@@ -548,7 +664,6 @@ def process_paper_event(payload: dict, is_test: bool):
             "paper_state": paper_state.copy(),
         }
 
-    # Fallback
     paper_state["last_action"] = action
     paper_state["last_reason"] = f"no paper rule for action: {action}"
     paper_state["updated_at_utc"] = utc_now()
@@ -572,6 +687,9 @@ def health_check():
         "message": "Receiver is running",
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
+        "mexc_leverage": MEXC_LEVERAGE,
+        "mexc_open_type": MEXC_OPEN_TYPE,
+        "mexc_order_type": MEXC_ORDER_TYPE,
     }
 
 
@@ -586,12 +704,6 @@ def get_state():
 
 @app.get("/mexc-open-positions")
 def mexc_open_positions(request: Request):
-    """
-    Read-only MEXC futures open-position check.
-
-    Browser test:
-    /mexc-open-positions?secret=...
-    """
     secret = request.query_params.get("secret")
 
     if secret != WEBHOOK_SECRET:
@@ -617,15 +729,6 @@ def mexc_open_positions(request: Request):
 
 @app.get("/entry-guard-test")
 def entry_guard_test(request: Request):
-    """
-    Browser-friendly entry guard test.
-
-    Examples:
-    /entry-guard-test?secret=...&side=long
-    /entry-guard-test?secret=...&side=short
-
-    This does NOT place orders.
-    """
     secret = request.query_params.get("secret")
     side = request.query_params.get("side", "long").lower()
 
@@ -641,10 +744,10 @@ def entry_guard_test(request: Request):
         "symbol": EXPECTED_SYMBOL,
         "action": simulated_action,
         "side": side.upper(),
-        "price": 0,
-        "stop": 0,
-        "target": 0,
-        "qty": 0,
+        "price": 78000,
+        "stop": 77220 if side == "long" else 78780,
+        "target": 79638 if side == "long" else 76362,
+        "qty": 0.0179,
         "time": None,
         "timeframe": EXPECTED_TIMEFRAME,
     }
@@ -656,12 +759,27 @@ def entry_guard_test(request: Request):
         mexc_position_snapshot=mexc_snapshot
     )
 
+    proposed_order = None
+    live_order_result = None
+
+    if entry_guard["guard_passed"] and entry_guard["would_enter"]:
+        try:
+            proposed_order = build_mexc_entry_order(simulated_payload)
+            live_order_result = maybe_place_live_order(proposed_order["order_body"])
+        except Exception as e:
+            live_order_result = {
+                "live_order_sent": False,
+                "reason": f"failed to build proposed order: {str(e)}",
+            }
+
     event = {
         "event": "entry_guard_test",
         "received_at_utc": utc_now(),
         "simulated_action": simulated_action,
         "paper_state": paper_state.copy(),
         "entry_guard": entry_guard,
+        "proposed_order": proposed_order,
+        "live_order_result": live_order_result,
     }
 
     print(json.dumps(event))
@@ -671,17 +789,49 @@ def entry_guard_test(request: Request):
         "simulated_action": simulated_action,
         "paper_state": paper_state.copy(),
         "entry_guard": entry_guard,
+        "proposed_order": proposed_order,
+        "live_order_result": live_order_result,
+    }
+
+
+@app.get("/dry-run-order")
+def dry_run_order(request: Request):
+    secret = request.query_params.get("secret")
+    side = request.query_params.get("side", "long").lower()
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    if side not in {"long", "short"}:
+        raise HTTPException(status_code=400, detail="side must be long or short")
+
+    simulated_action = "LONG_ENTRY" if side == "long" else "SHORT_ENTRY"
+
+    simulated_payload = {
+        "symbol": EXPECTED_SYMBOL,
+        "action": simulated_action,
+        "side": side.upper(),
+        "price": 78000,
+        "stop": 77220 if side == "long" else 78780,
+        "target": 79638 if side == "long" else 76362,
+        "qty": 0.0179,
+        "time": None,
+        "timeframe": EXPECTED_TIMEFRAME,
+    }
+
+    proposed_order = build_mexc_entry_order(simulated_payload)
+    live_order_result = maybe_place_live_order(proposed_order["order_body"])
+
+    return {
+        "status": "ok",
+        "simulated_payload": simulated_payload,
+        "proposed_order": proposed_order,
+        "live_order_result": live_order_result,
     }
 
 
 @app.post("/reset-state")
 def reset_state(request: Request):
-    """
-    Resets paper state manually.
-
-    Use carefully.
-    POST /reset-state?secret=...
-    """
     secret = request.query_params.get("secret")
 
     if secret != WEBHOOK_SECRET:
@@ -760,20 +910,31 @@ async def tradingview_webhook(request: Request):
         "mexc_position_snapshot": None,
     }
 
+    proposed_order = None
+    live_order_result = None
+
     if accepted:
-        # Get MEXC snapshot for entry events.
         base_action = clean_action(action)
 
         if base_action in {"LONG_ENTRY", "SHORT_ENTRY"}:
             mexc_position_snapshot = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+
             entry_guard = run_entry_guard(
                 payload,
                 is_test=is_test,
                 mexc_position_snapshot=mexc_position_snapshot
             )
 
-        # Paper state still updates for real events.
-        # TEST_ events are ignored by paper trader.
+            if entry_guard["guard_passed"] and entry_guard["would_enter"]:
+                try:
+                    proposed_order = build_mexc_entry_order(payload)
+                    live_order_result = maybe_place_live_order(proposed_order["order_body"])
+                except Exception as e:
+                    live_order_result = {
+                        "live_order_sent": False,
+                        "reason": f"failed to build proposed order: {str(e)}",
+                    }
+
         paper_result = process_paper_event(payload, is_test)
 
     event = {
@@ -784,11 +945,12 @@ async def tradingview_webhook(request: Request):
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "payload": payload,
         "entry_guard": entry_guard,
+        "proposed_order": proposed_order,
+        "live_order_result": live_order_result,
         "paper_result": paper_result,
         "mexc_position_snapshot": mexc_position_snapshot,
     }
 
-    # Free Render testing: print logs to Render dashboard.
     print(json.dumps(event))
 
     return {
@@ -799,6 +961,8 @@ async def tradingview_webhook(request: Request):
         "is_test": is_test,
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "entry_guard": entry_guard,
+        "proposed_order": proposed_order,
+        "live_order_result": live_order_result,
         "paper_result": paper_result,
         "mexc_position_snapshot": mexc_position_snapshot,
     }
