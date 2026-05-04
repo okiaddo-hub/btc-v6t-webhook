@@ -183,11 +183,13 @@ def mexc_get_private(path: str, params=None):
         url += "?" + query_string
 
     headers = {
-        "ApiKey": MEXC_ACCESS_KEY,
-        "Request-Time": request_time,
-        "Signature": signature,
-        "Content-Type": "application/json",
-        "Recv-Window": "30000",
+    "ApiKey": MEXC_ACCESS_KEY,
+    "Request-Time": request_time,
+    "Signature": signature,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 V6T-Render-Bot/1.0",
+    "Recv-Window": "30000",
     }
 
     req = urllib.request.Request(url, headers=headers, method="GET")
