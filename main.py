@@ -14,6 +14,12 @@ ALLOWED_ACTIONS = {
     "SHORT_TRAIL_UPDATE",
     "LONG_EXIT",
     "SHORT_EXIT",
+    "TEST_LONG_ENTRY",
+    "TEST_SHORT_ENTRY",
+    "TEST_LONG_TRAIL_UPDATE",
+    "TEST_SHORT_TRAIL_UPDATE",
+    "TEST_LONG_EXIT",
+    "TEST_SHORT_EXIT",
 }
 
 EXPECTED_SYMBOL = "BTCUSDT_MEXC"
@@ -60,10 +66,13 @@ async def tradingview_webhook(request: Request):
         accepted = False
         reason = f"invalid action: {action}"
 
+    is_test = isinstance(action, str) and action.startswith("TEST_")
+
     event = {
         "received_at_utc": datetime.now(timezone.utc).isoformat(),
         "accepted": accepted,
         "reason": reason,
+        "is_test": is_test,
         "payload": payload,
     }
 
@@ -76,4 +85,5 @@ async def tradingview_webhook(request: Request):
         "accepted": accepted,
         "reason": reason,
         "received_action": action,
+        "is_test": is_test,
     }
