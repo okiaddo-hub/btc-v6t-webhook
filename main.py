@@ -2,10 +2,25 @@ from fastapi import FastAPI, Request, HTTPException
 from datetime import datetime, timezone
 import json
 import os
+import time
+import hmac
+import hashlib
+import urllib.parse
+import urllib.request
+import urllib.error
 
 app = FastAPI()
 
 WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "change-this-secret")
+
+# MEXC environment variables
+MEXC_ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY")
+MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
+LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+
+# MEXC futures contract symbols usually use underscore format, e.g. BTC_USDT.
+MEXC_CONTRACT_SYMBOL = os.getenv("MEXC_CONTRACT_SYMBOL", "BTC_USDT")
+MEXC_CONTRACT_BASE_URL = "https://contract.mexc.com"
 
 ALLOWED_ACTIONS = {
     "LONG_ENTRY",
@@ -60,6 +75,102 @@ def clean_action(action: str) -> str:
     return action
 
 
+# =====================================================
+# MEXC read-only helpers
+# =====================================================
+
+def mexc_get_private(path: str, params: dict | None = None):
+    """
+    Sends signed GET request to MEXC Contract API.
+
+    Signing rule for private GET:
+    signature payload = accessKey + timestamp + sorted_query_string
+    signature = HMAC_SHA256(secret, payload)
+    """
+    if not MEXC_ACCESS_KEY or not MEXC_SECRET_KEY:
+        return {
+            "ok": False,
+            "error": "MEXC_ACCESS_KEY or MEXC_SECRET_KEY missing in Render environment variables",
+        }
+
+    params = params or {}
+
+    # Remove None values so they do not participate in signature.
+    clean_params = {
+        k: v for k, v in params.items()
+        if v is not None and v != ""
+    }
+
+    # MEXC docs say GET params are sorted and joined with &.
+    query_string = urllib.parse.urlencode(sorted(clean_params.items()))
+
+    request_time = str(int(time.time() * 1000))
+    signature_payload = MEXC_ACCESS_KEY + request_time + query_string
+
+    signature = hmac.new(
+        MEXC_SECRET_KEY.encode("utf-8"),
+        signature_payload.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    url = MEXC_CONTRACT_BASE_URL + path
+    if query_string:
+        url += "?" + query_string
+
+    headers = {
+        "ApiKey": MEXC_ACCESS_KEY,
+        "Request-Time": request_time,
+        "Signature": signature,
+        "Content-Type": "application/json",
+        "Recv-Window": "30000",
+    }
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            raw = response.read().decode("utf-8")
+            return {
+                "ok": True,
+                "status_code": response.status,
+                "data": json.loads(raw),
+            }
+
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = raw
+
+        return {
+            "ok": False,
+            "status_code": e.code,
+            "error": parsed,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
+def get_mexc_open_positions(symbol: str | None = None):
+    params = {}
+    if symbol:
+        params["symbol"] = symbol
+
+    return mexc_get_private(
+        "/api/v1/private/position/open_positions",
+        params=params
+    )
+
+
+# =====================================================
+# Paper state machine
+# =====================================================
+
 def process_paper_event(payload: dict, is_test: bool):
     """
     Simulates future execution logic without touching MEXC.
@@ -70,7 +181,6 @@ def process_paper_event(payload: dict, is_test: bool):
     action = payload.get("action")
     base_action = clean_action(action)
 
-    side = payload.get("side")
     price = payload.get("price")
     stop = payload.get("stop")
     target = payload.get("target")
@@ -301,12 +411,18 @@ def process_paper_event(payload: dict, is_test: bool):
     }
 
 
+# =====================================================
+# Routes
+# =====================================================
+
 @app.get("/")
 def health_check():
     return {
         "status": "ok",
         "service": "btc-v6t-webhook-receiver",
         "message": "Receiver is running",
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
     }
 
 
@@ -315,6 +431,38 @@ def get_state():
     return {
         "status": "ok",
         "paper_state": paper_state,
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
+    }
+
+
+@app.get("/mexc-open-positions")
+def mexc_open_positions(request: Request):
+    """
+    Read-only MEXC futures open-position check.
+
+    Browser test:
+    /mexc-open-positions?secret=...
+    """
+    secret = request.query_params.get("secret")
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    result = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+
+    print(json.dumps({
+        "event": "mexc_open_positions_check",
+        "received_at_utc": utc_now(),
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
+        "result": result,
+    }))
+
+    return {
+        "status": "ok",
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
+        "mexc_result": result,
     }
 
 
@@ -323,9 +471,8 @@ def reset_state(request: Request):
     """
     Resets paper state manually.
 
-    Use carefully. This is helpful during testing.
-    For now, this uses the same secret in the query string:
-    /reset-state?secret=...
+    Use carefully.
+    POST /reset-state?secret=...
     """
     secret = request.query_params.get("secret")
 
@@ -395,16 +542,25 @@ async def tradingview_webhook(request: Request):
         "paper_state": paper_state.copy(),
     }
 
+    mexc_position_snapshot = None
+
     if accepted:
         paper_result = process_paper_event(payload, is_test)
+
+        # Read-only MEXC snapshot for real events only.
+        # This does not trade.
+        if not is_test:
+            mexc_position_snapshot = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
 
     event = {
         "received_at_utc": utc_now(),
         "webhook_accepted": accepted,
         "webhook_reason": reason,
         "is_test": is_test,
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
         "payload": payload,
         "paper_result": paper_result,
+        "mexc_position_snapshot": mexc_position_snapshot,
     }
 
     # Free Render testing: print logs to Render dashboard.
@@ -416,5 +572,7 @@ async def tradingview_webhook(request: Request):
         "webhook_reason": reason,
         "received_action": action,
         "is_test": is_test,
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
         "paper_result": paper_result,
+        "mexc_position_snapshot": mexc_position_snapshot,
     }
