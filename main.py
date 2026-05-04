@@ -23,12 +23,15 @@ LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "tr
 MEXC_CONTRACT_SYMBOL = os.getenv("MEXC_CONTRACT_SYMBOL", "BTC_USDT")
 MEXC_CONTRACT_BASE_URL = "https://contract.mexc.com"
 
-# Execution assumptions.
-# IMPORTANT: verify MEXC `vol` unit before enabling live execution.
+# Execution assumptions
 MEXC_LEVERAGE = int(os.getenv("MEXC_LEVERAGE", "4"))
-MEXC_OPEN_TYPE = int(os.getenv("MEXC_OPEN_TYPE", "1"))  # 1 isolated, 2 cross
-MEXC_ORDER_TYPE = int(os.getenv("MEXC_ORDER_TYPE", "5"))  # 5 market order
-MEXC_POSITION_MODE = int(os.getenv("MEXC_POSITION_MODE", "2"))  # 2 one-way; confirm on your account
+MEXC_OPEN_TYPE = int(os.getenv("MEXC_OPEN_TYPE", "1"))       # 1 isolated, 2 cross
+MEXC_ORDER_TYPE = int(os.getenv("MEXC_ORDER_TYPE", "5"))     # 5 market order
+MEXC_POSITION_MODE = int(os.getenv("MEXC_POSITION_MODE", "2"))
+
+# Hard order-size guards
+MAX_ORDER_VOL = float(os.getenv("MAX_ORDER_VOL", "0.02"))
+MIN_ORDER_VOL = float(os.getenv("MIN_ORDER_VOL", "0.0001"))
 
 ALLOWED_ACTIONS = {
     "LONG_ENTRY",
@@ -49,15 +52,8 @@ EXPECTED_SYMBOL = "BTCUSDT_MEXC"
 EXPECTED_TIMEFRAME = "15"
 
 
-# =====================================================
-# In-memory paper state
-# NOTE:
-# On free Render, this can reset if the service restarts/sleeps.
-# Good for testing logic, not permanent recordkeeping.
-# =====================================================
-
 paper_state = {
-    "position": "flat",       # flat / long / short
+    "position": "flat",
     "entry": None,
     "stop": None,
     "target": None,
@@ -87,12 +83,6 @@ def to_float(value, field_name: str):
 
 
 def has_open_mexc_position(mexc_result: dict):
-    """
-    Interprets MEXC open position response.
-
-    Returns:
-    (has_position, reason)
-    """
     if not mexc_result.get("ok"):
         return False, f"MEXC position check failed: {mexc_result}"
 
@@ -143,10 +133,6 @@ def has_open_mexc_position(mexc_result: dict):
 # =====================================================
 
 def mexc_sign(payload: str, request_time: str):
-    """
-    MEXC contract private signature:
-    accessKey + timestamp + query/body string
-    """
     signature_payload = MEXC_ACCESS_KEY + request_time + payload
 
     return hmac.new(
@@ -218,12 +204,6 @@ def mexc_get_private(path: str, params=None):
 
 
 def mexc_post_private(path: str, body: dict):
-    """
-    Signed POST request to MEXC Contract API.
-
-    This function can place live orders if called while using order permissions.
-    We only call it when LIVE_TRADING_ENABLED=true.
-    """
     if not MEXC_ACCESS_KEY or not MEXC_SECRET_KEY:
         return {
             "ok": False,
@@ -293,29 +273,32 @@ def get_mexc_open_positions(symbol=None):
 
 
 # =====================================================
-# Order dry-run / order payload builder
+# Order validation and order builder
 # =====================================================
 
-def build_mexc_entry_order(payload: dict):
-    """
-    Builds the exact MEXC order body we would send for entry.
-
-    IMPORTANT:
-    This currently assumes TradingView qty can be used as MEXC vol.
-    Verify MEXC BTC_USDT contract volume unit before enabling live execution.
-    """
+def validate_entry_payload(payload: dict):
     action = payload.get("action")
     base_action = clean_action(action)
 
     if base_action not in {"LONG_ENTRY", "SHORT_ENTRY"}:
-        raise ValueError(f"Cannot build entry order for non-entry action: {action}")
+        raise ValueError(f"Cannot validate non-entry action: {action}")
 
+    price = to_float(payload.get("price"), "price")
     qty = to_float(payload.get("qty"), "qty")
     stop = to_float(payload.get("stop"), "stop")
     target = to_float(payload.get("target"), "target")
 
+    if price <= 0:
+        raise ValueError(f"price must be > 0, got {price}")
+
     if qty <= 0:
         raise ValueError(f"qty must be > 0, got {qty}")
+
+    if qty < MIN_ORDER_VOL:
+        raise ValueError(f"qty {qty} is below MIN_ORDER_VOL {MIN_ORDER_VOL}")
+
+    if qty > MAX_ORDER_VOL:
+        raise ValueError(f"qty {qty} exceeds MAX_ORDER_VOL {MAX_ORDER_VOL}")
 
     if stop <= 0:
         raise ValueError(f"stop must be > 0, got {stop}")
@@ -323,7 +306,36 @@ def build_mexc_entry_order(payload: dict):
     if target <= 0:
         raise ValueError(f"target must be > 0, got {target}")
 
-    side = 1 if base_action == "LONG_ENTRY" else 3  # 1 open long, 3 open short
+    if base_action == "LONG_ENTRY":
+        if not stop < price:
+            raise ValueError(f"LONG geometry invalid: stop {stop} must be below price {price}")
+        if not target > price:
+            raise ValueError(f"LONG geometry invalid: target {target} must be above price {price}")
+
+    if base_action == "SHORT_ENTRY":
+        if not stop > price:
+            raise ValueError(f"SHORT geometry invalid: stop {stop} must be above price {price}")
+        if not target < price:
+            raise ValueError(f"SHORT geometry invalid: target {target} must be below price {price}")
+
+    return {
+        "price": price,
+        "qty": qty,
+        "stop": stop,
+        "target": target,
+        "base_action": base_action,
+    }
+
+
+def build_mexc_entry_order(payload: dict):
+    validated = validate_entry_payload(payload)
+
+    qty = validated["qty"]
+    stop = validated["stop"]
+    target = validated["target"]
+    base_action = validated["base_action"]
+
+    side = 1 if base_action == "LONG_ENTRY" else 3
 
     external_oid = "v6t_" + str(uuid.uuid4()).replace("-", "")[:24]
 
@@ -343,6 +355,12 @@ def build_mexc_entry_order(payload: dict):
 
     return {
         "order_body": order_body,
+        "validation": {
+            "passed": True,
+            "min_order_vol": MIN_ORDER_VOL,
+            "max_order_vol": MAX_ORDER_VOL,
+            "geometry_checked": True,
+        },
         "warnings": [
             "DRY RUN ONLY unless LIVE_TRADING_ENABLED=true.",
             "Verify MEXC vol unit before live execution. Current assumption: TradingView qty == MEXC vol.",
@@ -352,10 +370,6 @@ def build_mexc_entry_order(payload: dict):
 
 
 def maybe_place_live_order(order_body: dict):
-    """
-    Places live order only if LIVE_TRADING_ENABLED=true.
-    Otherwise returns dry-run result.
-    """
     if not LIVE_TRADING_ENABLED:
         return {
             "live_order_sent": False,
@@ -404,6 +418,16 @@ def run_entry_guard(payload: dict, is_test: bool, mexc_position_snapshot=None):
             "guard_passed": False,
             "would_enter": False,
             "reason": "test event rejected by entry guard",
+        })
+        return result
+
+    try:
+        validate_entry_payload(payload)
+    except Exception as e:
+        result.update({
+            "guard_passed": False,
+            "would_enter": False,
+            "reason": f"entry payload validation failed: {str(e)}",
         })
         return result
 
@@ -690,6 +714,8 @@ def health_check():
         "mexc_leverage": MEXC_LEVERAGE,
         "mexc_open_type": MEXC_OPEN_TYPE,
         "mexc_order_type": MEXC_ORDER_TYPE,
+        "min_order_vol": MIN_ORDER_VOL,
+        "max_order_vol": MAX_ORDER_VOL,
     }
 
 
@@ -798,6 +824,7 @@ def entry_guard_test(request: Request):
 def dry_run_order(request: Request):
     secret = request.query_params.get("secret")
     side = request.query_params.get("side", "long").lower()
+    qty_param = request.query_params.get("qty")
 
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
@@ -807,6 +834,10 @@ def dry_run_order(request: Request):
 
     simulated_action = "LONG_ENTRY" if side == "long" else "SHORT_ENTRY"
 
+    simulated_qty = 0.0179
+    if qty_param is not None:
+        simulated_qty = to_float(qty_param, "qty")
+
     simulated_payload = {
         "symbol": EXPECTED_SYMBOL,
         "action": simulated_action,
@@ -814,13 +845,22 @@ def dry_run_order(request: Request):
         "price": 78000,
         "stop": 77220 if side == "long" else 78780,
         "target": 79638 if side == "long" else 76362,
-        "qty": 0.0179,
+        "qty": simulated_qty,
         "time": None,
         "timeframe": EXPECTED_TIMEFRAME,
     }
 
-    proposed_order = build_mexc_entry_order(simulated_payload)
-    live_order_result = maybe_place_live_order(proposed_order["order_body"])
+    proposed_order = None
+    live_order_result = None
+
+    try:
+        proposed_order = build_mexc_entry_order(simulated_payload)
+        live_order_result = maybe_place_live_order(proposed_order["order_body"])
+    except Exception as e:
+        live_order_result = {
+            "live_order_sent": False,
+            "reason": f"failed to build proposed order: {str(e)}",
+        }
 
     return {
         "status": "ok",
