@@ -14,16 +14,25 @@ app = FastAPI()
 
 WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "change-this-secret")
 
-# MEXC environment variables
+# =====================================================
+# Environment variables
+# =====================================================
+
 MEXC_ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
+
+# Main arming switch.
+# If false, no live MEXC order can be placed.
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+
+# Separate switch for automatic TradingView webhook execution.
+# Keep this false during first manual live test.
+AUTO_TV_EXECUTION_ENABLED = os.getenv("AUTO_TV_EXECUTION_ENABLED", "false").lower() == "true"
 
 # MEXC futures settings
 MEXC_CONTRACT_SYMBOL = os.getenv("MEXC_CONTRACT_SYMBOL", "BTC_USDT")
 MEXC_CONTRACT_BASE_URL = "https://contract.mexc.com"
 
-# Execution assumptions
 MEXC_LEVERAGE = int(os.getenv("MEXC_LEVERAGE", "4"))
 MEXC_OPEN_TYPE = int(os.getenv("MEXC_OPEN_TYPE", "1"))       # 1 isolated, 2 cross
 MEXC_ORDER_TYPE = int(os.getenv("MEXC_ORDER_TYPE", "5"))     # 5 market order
@@ -32,6 +41,11 @@ MEXC_POSITION_MODE = int(os.getenv("MEXC_POSITION_MODE", "2"))
 # Hard order-size guards
 MAX_ORDER_VOL = float(os.getenv("MAX_ORDER_VOL", "0.02"))
 MIN_ORDER_VOL = float(os.getenv("MIN_ORDER_VOL", "0.0001"))
+
+# Separate stricter cap for manual live test
+MAX_MANUAL_TEST_VOL = float(os.getenv("MAX_MANUAL_TEST_VOL", "0.001"))
+
+MANUAL_LIVE_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_PLACES_A_LIVE_ORDER"
 
 ALLOWED_ACTIONS = {
     "LONG_ENTRY",
@@ -51,6 +65,10 @@ ALLOWED_ACTIONS = {
 EXPECTED_SYMBOL = "BTCUSDT_MEXC"
 EXPECTED_TIMEFRAME = "15"
 
+
+# =====================================================
+# In-memory paper state
+# =====================================================
 
 paper_state = {
     "position": "flat",
@@ -362,18 +380,26 @@ def build_mexc_entry_order(payload: dict):
             "geometry_checked": True,
         },
         "warnings": [
-            "DRY RUN ONLY unless LIVE_TRADING_ENABLED=true.",
-            "Verify MEXC vol unit before live execution. Current assumption: TradingView qty == MEXC vol.",
+            "DRY RUN ONLY unless this is called by /manual-live-test with LIVE_TRADING_ENABLED=true.",
+            "MEXC vol unit has been visually checked from the trading panel for BTC_USDT.",
             "Verify MEXC account is isolated margin and one-way mode before live execution.",
         ],
     }
 
 
-def maybe_place_live_order(order_body: dict):
+def dry_run_only(order_body: dict):
+    return {
+        "live_order_sent": False,
+        "reason": "dry run only - this endpoint never submits orders",
+        "would_send_order": order_body,
+    }
+
+
+def place_live_order_only_if_armed(order_body: dict):
     if not LIVE_TRADING_ENABLED:
         return {
             "live_order_sent": False,
-            "reason": "dry run only - LIVE_TRADING_ENABLED=false",
+            "reason": "blocked - LIVE_TRADING_ENABLED=false",
             "would_send_order": order_body,
         }
 
@@ -400,6 +426,7 @@ def run_entry_guard(payload: dict, is_test: bool, mexc_position_snapshot=None):
         "guard_passed": False,
         "would_enter": False,
         "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
         "reason": "not checked",
         "mexc_position_snapshot": mexc_position_snapshot,
     }
@@ -710,12 +737,14 @@ def health_check():
         "service": "btc-v6t-webhook-receiver",
         "message": "Receiver is running",
         "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
         "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
         "mexc_leverage": MEXC_LEVERAGE,
         "mexc_open_type": MEXC_OPEN_TYPE,
         "mexc_order_type": MEXC_ORDER_TYPE,
         "min_order_vol": MIN_ORDER_VOL,
         "max_order_vol": MAX_ORDER_VOL,
+        "max_manual_test_vol": MAX_MANUAL_TEST_VOL,
     }
 
 
@@ -725,6 +754,7 @@ def get_state():
         "status": "ok",
         "paper_state": paper_state,
         "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
     }
 
 
@@ -773,7 +803,7 @@ def entry_guard_test(request: Request):
         "price": 78000,
         "stop": 77220 if side == "long" else 78780,
         "target": 79638 if side == "long" else 76362,
-        "qty": 0.0179,
+        "qty": 0.001,
         "time": None,
         "timeframe": EXPECTED_TIMEFRAME,
     }
@@ -786,14 +816,14 @@ def entry_guard_test(request: Request):
     )
 
     proposed_order = None
-    live_order_result = None
+    dry_run_result = None
 
     if entry_guard["guard_passed"] and entry_guard["would_enter"]:
         try:
             proposed_order = build_mexc_entry_order(simulated_payload)
-            live_order_result = maybe_place_live_order(proposed_order["order_body"])
+            dry_run_result = dry_run_only(proposed_order["order_body"])
         except Exception as e:
-            live_order_result = {
+            dry_run_result = {
                 "live_order_sent": False,
                 "reason": f"failed to build proposed order: {str(e)}",
             }
@@ -805,7 +835,7 @@ def entry_guard_test(request: Request):
         "paper_state": paper_state.copy(),
         "entry_guard": entry_guard,
         "proposed_order": proposed_order,
-        "live_order_result": live_order_result,
+        "dry_run_result": dry_run_result,
     }
 
     print(json.dumps(event))
@@ -816,7 +846,7 @@ def entry_guard_test(request: Request):
         "paper_state": paper_state.copy(),
         "entry_guard": entry_guard,
         "proposed_order": proposed_order,
-        "live_order_result": live_order_result,
+        "dry_run_result": dry_run_result,
     }
 
 
@@ -834,7 +864,7 @@ def dry_run_order(request: Request):
 
     simulated_action = "LONG_ENTRY" if side == "long" else "SHORT_ENTRY"
 
-    simulated_qty = 0.0179
+    simulated_qty = 0.001
     if qty_param is not None:
         simulated_qty = to_float(qty_param, "qty")
 
@@ -851,13 +881,13 @@ def dry_run_order(request: Request):
     }
 
     proposed_order = None
-    live_order_result = None
+    dry_run_result = None
 
     try:
         proposed_order = build_mexc_entry_order(simulated_payload)
-        live_order_result = maybe_place_live_order(proposed_order["order_body"])
+        dry_run_result = dry_run_only(proposed_order["order_body"])
     except Exception as e:
-        live_order_result = {
+        dry_run_result = {
             "live_order_sent": False,
             "reason": f"failed to build proposed order: {str(e)}",
         }
@@ -865,6 +895,118 @@ def dry_run_order(request: Request):
     return {
         "status": "ok",
         "simulated_payload": simulated_payload,
+        "proposed_order": proposed_order,
+        "dry_run_result": dry_run_result,
+    }
+
+
+@app.get("/manual-live-test")
+def manual_live_test(request: Request):
+    """
+    Controlled one-off live order test.
+
+    Required query params:
+    - secret
+    - side=long or short
+    - qty
+    - price
+    - stop
+    - target
+    - confirm=I_UNDERSTAND_THIS_PLACES_A_LIVE_ORDER
+
+    Example:
+    /manual-live-test?secret=...&side=long&qty=0.001&price=79000&stop=78210&target=80659&confirm=I_UNDERSTAND_THIS_PLACES_A_LIVE_ORDER
+    """
+    secret = request.query_params.get("secret")
+    side = request.query_params.get("side", "").lower()
+    confirm = request.query_params.get("confirm")
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    if confirm != MANUAL_LIVE_CONFIRM_PHRASE:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing or incorrect confirmation phrase. This endpoint can place a live order."
+        )
+
+    if not LIVE_TRADING_ENABLED:
+        return {
+            "status": "blocked",
+            "reason": "LIVE_TRADING_ENABLED=false",
+            "live_order_sent": False,
+        }
+
+    if side not in {"long", "short"}:
+        raise HTTPException(status_code=400, detail="side must be long or short")
+
+    qty = to_float(request.query_params.get("qty"), "qty")
+    price = to_float(request.query_params.get("price"), "price")
+    stop = to_float(request.query_params.get("stop"), "stop")
+    target = to_float(request.query_params.get("target"), "target")
+
+    if qty > MAX_MANUAL_TEST_VOL:
+        return {
+            "status": "blocked",
+            "reason": f"qty {qty} exceeds MAX_MANUAL_TEST_VOL {MAX_MANUAL_TEST_VOL}",
+            "live_order_sent": False,
+        }
+
+    simulated_action = "LONG_ENTRY" if side == "long" else "SHORT_ENTRY"
+
+    payload = {
+        "symbol": EXPECTED_SYMBOL,
+        "action": simulated_action,
+        "side": side.upper(),
+        "price": price,
+        "stop": stop,
+        "target": target,
+        "qty": qty,
+        "time": None,
+        "timeframe": EXPECTED_TIMEFRAME,
+    }
+
+    mexc_snapshot = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+    entry_guard = run_entry_guard(
+        payload,
+        is_test=False,
+        mexc_position_snapshot=mexc_snapshot
+    )
+
+    if not entry_guard["guard_passed"] or not entry_guard["would_enter"]:
+        return {
+            "status": "blocked",
+            "reason": "entry guard blocked manual live test",
+            "entry_guard": entry_guard,
+            "live_order_sent": False,
+        }
+
+    try:
+        proposed_order = build_mexc_entry_order(payload)
+    except Exception as e:
+        return {
+            "status": "blocked",
+            "reason": f"failed to build proposed order: {str(e)}",
+            "live_order_sent": False,
+        }
+
+    live_order_result = place_live_order_only_if_armed(proposed_order["order_body"])
+
+    event = {
+        "event": "manual_live_test",
+        "received_at_utc": utc_now(),
+        "payload": payload,
+        "entry_guard": entry_guard,
+        "proposed_order": proposed_order,
+        "live_order_result": live_order_result,
+    }
+
+    print(json.dumps(event))
+
+    return {
+        "status": "ok",
+        "payload": payload,
+        "entry_guard": entry_guard,
         "proposed_order": proposed_order,
         "live_order_result": live_order_result,
     }
@@ -946,12 +1088,13 @@ async def tradingview_webhook(request: Request):
         "guard_passed": False,
         "would_enter": False,
         "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
         "reason": "webhook validation failed",
         "mexc_position_snapshot": None,
     }
 
     proposed_order = None
-    live_order_result = None
+    tv_execution_result = None
 
     if accepted:
         base_action = clean_action(action)
@@ -968,9 +1111,20 @@ async def tradingview_webhook(request: Request):
             if entry_guard["guard_passed"] and entry_guard["would_enter"]:
                 try:
                     proposed_order = build_mexc_entry_order(payload)
-                    live_order_result = maybe_place_live_order(proposed_order["order_body"])
+
+                    if LIVE_TRADING_ENABLED and AUTO_TV_EXECUTION_ENABLED:
+                        tv_execution_result = place_live_order_only_if_armed(proposed_order["order_body"])
+                    else:
+                        tv_execution_result = {
+                            "live_order_sent": False,
+                            "reason": "TradingView auto execution disabled. No live order submitted.",
+                            "live_trading_enabled": LIVE_TRADING_ENABLED,
+                            "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
+                            "would_send_order": proposed_order["order_body"],
+                        }
+
                 except Exception as e:
-                    live_order_result = {
+                    tv_execution_result = {
                         "live_order_sent": False,
                         "reason": f"failed to build proposed order: {str(e)}",
                     }
@@ -983,10 +1137,11 @@ async def tradingview_webhook(request: Request):
         "webhook_reason": reason,
         "is_test": is_test,
         "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
         "payload": payload,
         "entry_guard": entry_guard,
         "proposed_order": proposed_order,
-        "live_order_result": live_order_result,
+        "tv_execution_result": tv_execution_result,
         "paper_result": paper_result,
         "mexc_position_snapshot": mexc_position_snapshot,
     }
@@ -1000,9 +1155,10 @@ async def tradingview_webhook(request: Request):
         "received_action": action,
         "is_test": is_test,
         "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
         "entry_guard": entry_guard,
         "proposed_order": proposed_order,
-        "live_order_result": live_order_result,
+        "tv_execution_result": tv_execution_result,
         "paper_result": paper_result,
         "mexc_position_snapshot": mexc_position_snapshot,
     }
