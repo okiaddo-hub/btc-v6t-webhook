@@ -38,11 +38,21 @@ MEXC_OPEN_TYPE = int(os.getenv("MEXC_OPEN_TYPE", "1"))       # 1 isolated, 2 cro
 MEXC_ORDER_TYPE = int(os.getenv("MEXC_ORDER_TYPE", "5"))     # 5 market order
 MEXC_POSITION_MODE = int(os.getenv("MEXC_POSITION_MODE", "2"))
 
-# Hard order-size guards
+# BTC_USDT contract detail from MEXC:
+# contractSize = 0.0001 BTC
+# volScale = 0
+# volUnit = 1
+# minVol = 1
+MEXC_CONTRACT_SIZE = float(os.getenv("MEXC_CONTRACT_SIZE", "0.0001"))
+MEXC_MIN_CONTRACT_VOL = int(os.getenv("MEXC_MIN_CONTRACT_VOL", "1"))
+
+# Hard order-size guards.
+# These are in BTC quantity from TradingView / URL input, not MEXC contract count.
 MAX_ORDER_VOL = float(os.getenv("MAX_ORDER_VOL", "0.02"))
 MIN_ORDER_VOL = float(os.getenv("MIN_ORDER_VOL", "0.0001"))
 
-# Separate stricter cap for manual live test
+# Separate stricter cap for manual live test.
+# Also in BTC quantity.
 MAX_MANUAL_TEST_VOL = float(os.getenv("MAX_MANUAL_TEST_VOL", "0.001"))
 
 MANUAL_LIVE_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_PLACES_A_LIVE_ORDER"
@@ -98,6 +108,39 @@ def to_float(value, field_name: str):
         return float(value)
     except Exception:
         raise ValueError(f"{field_name} must be numeric, got {value}")
+
+
+def btc_qty_to_mexc_vol(qty_btc: float):
+    """
+    Converts BTC quantity into MEXC contract volume.
+
+    For BTC_USDT:
+    contractSize = 0.0001 BTC
+    Therefore:
+    0.001 BTC / 0.0001 = 10 contracts
+
+    MEXC volScale = 0, so vol must be an integer.
+    """
+    raw_vol = qty_btc / MEXC_CONTRACT_SIZE
+    mexc_vol = int(round(raw_vol))
+
+    if mexc_vol < MEXC_MIN_CONTRACT_VOL:
+        raise ValueError(
+            f"Calculated MEXC vol {mexc_vol} is below minimum {MEXC_MIN_CONTRACT_VOL}. "
+            f"qty_btc={qty_btc}, contract_size={MEXC_CONTRACT_SIZE}"
+        )
+
+    # Sanity check: avoid accepting a quantity that does not convert cleanly.
+    reconstructed_qty = mexc_vol * MEXC_CONTRACT_SIZE
+    conversion_error = abs(reconstructed_qty - qty_btc)
+
+    if conversion_error > (MEXC_CONTRACT_SIZE / 10):
+        raise ValueError(
+            f"BTC qty does not convert cleanly to MEXC contract volume. "
+            f"qty_btc={qty_btc}, mexc_vol={mexc_vol}, reconstructed_qty={reconstructed_qty}"
+        )
+
+    return mexc_vol
 
 
 def has_open_mexc_position(mexc_result: dict):
@@ -352,12 +395,17 @@ def validate_entry_payload(payload: dict):
 def build_mexc_entry_order(payload: dict):
     """
     Builds a MEXC market entry order WITH attached SL/TP.
-    This currently fails because MEXC rejects the attached stop-limit/TP fields.
-    Kept for later SL/TP debugging.
+
+    NOTE:
+    MEXC previously rejected attached SL/TP with code 5003.
+    This function now converts BTC qty to MEXC contract vol correctly,
+    but attached SL/TP may still need separate MEXC plan-order handling.
     """
     validated = validate_entry_payload(payload)
 
-    qty = validated["qty"]
+    qty_btc = validated["qty"]
+    mexc_vol = btc_qty_to_mexc_vol(qty_btc)
+
     stop = validated["stop"]
     target = validated["target"]
     base_action = validated["base_action"]
@@ -369,7 +417,7 @@ def build_mexc_entry_order(payload: dict):
     order_body = {
         "symbol": MEXC_CONTRACT_SYMBOL,
         "price": 0,
-        "vol": qty,
+        "vol": mexc_vol,
         "leverage": MEXC_LEVERAGE,
         "side": side,
         "type": MEXC_ORDER_TYPE,
@@ -382,10 +430,15 @@ def build_mexc_entry_order(payload: dict):
 
     return {
         "order_body": order_body,
+        "conversion": {
+            "input_qty_btc": qty_btc,
+            "mexc_contract_size": MEXC_CONTRACT_SIZE,
+            "mexc_vol_contracts": mexc_vol,
+        },
         "validation": {
             "passed": True,
-            "min_order_vol": MIN_ORDER_VOL,
-            "max_order_vol": MAX_ORDER_VOL,
+            "min_order_vol_btc": MIN_ORDER_VOL,
+            "max_order_vol_btc": MAX_ORDER_VOL,
             "geometry_checked": True,
             "attached_sl_tp": True,
         },
@@ -405,7 +458,9 @@ def build_mexc_entry_only_order(payload: dict):
     """
     validated = validate_entry_payload(payload)
 
-    qty = validated["qty"]
+    qty_btc = validated["qty"]
+    mexc_vol = btc_qty_to_mexc_vol(qty_btc)
+
     base_action = validated["base_action"]
 
     side = 1 if base_action == "LONG_ENTRY" else 3
@@ -415,7 +470,7 @@ def build_mexc_entry_only_order(payload: dict):
     order_body = {
         "symbol": MEXC_CONTRACT_SYMBOL,
         "price": 0,
-        "vol": qty,
+        "vol": mexc_vol,
         "leverage": MEXC_LEVERAGE,
         "side": side,
         "type": MEXC_ORDER_TYPE,
@@ -426,11 +481,16 @@ def build_mexc_entry_only_order(payload: dict):
 
     return {
         "order_body": order_body,
+        "conversion": {
+            "input_qty_btc": qty_btc,
+            "mexc_contract_size": MEXC_CONTRACT_SIZE,
+            "mexc_vol_contracts": mexc_vol,
+        },
         "validation": {
             "passed": True,
-            "min_order_vol": MIN_ORDER_VOL,
-            "max_order_vol": MAX_ORDER_VOL,
-            "max_manual_test_vol": MAX_MANUAL_TEST_VOL,
+            "min_order_vol_btc": MIN_ORDER_VOL,
+            "max_order_vol_btc": MAX_ORDER_VOL,
+            "max_manual_test_vol_btc": MAX_MANUAL_TEST_VOL,
             "entry_only": True,
             "attached_sl_tp": False,
         },
@@ -795,12 +855,14 @@ def health_check():
         "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
         "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
         "mexc_base_url": MEXC_CONTRACT_BASE_URL,
+        "mexc_contract_size": MEXC_CONTRACT_SIZE,
+        "mexc_min_contract_vol": MEXC_MIN_CONTRACT_VOL,
         "mexc_leverage": MEXC_LEVERAGE,
         "mexc_open_type": MEXC_OPEN_TYPE,
         "mexc_order_type": MEXC_ORDER_TYPE,
-        "min_order_vol": MIN_ORDER_VOL,
-        "max_order_vol": MAX_ORDER_VOL,
-        "max_manual_test_vol": MAX_MANUAL_TEST_VOL,
+        "min_order_vol_btc": MIN_ORDER_VOL,
+        "max_order_vol_btc": MAX_ORDER_VOL,
+        "max_manual_test_vol_btc": MAX_MANUAL_TEST_VOL,
     }
 
 
