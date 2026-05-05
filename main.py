@@ -26,12 +26,12 @@ MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
 
 # Separate switch for automatic TradingView webhook execution.
-# Keep this false during first manual live test.
+# Keep this false during manual testing.
 AUTO_TV_EXECUTION_ENABLED = os.getenv("AUTO_TV_EXECUTION_ENABLED", "false").lower() == "true"
 
 # MEXC futures settings
 MEXC_CONTRACT_SYMBOL = os.getenv("MEXC_CONTRACT_SYMBOL", "BTC_USDT")
-MEXC_CONTRACT_BASE_URL = "https://contract.mexc.com"
+MEXC_CONTRACT_BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://api.mexc.com")
 
 MEXC_LEVERAGE = int(os.getenv("MEXC_LEVERAGE", "4"))
 MEXC_OPEN_TYPE = int(os.getenv("MEXC_OPEN_TYPE", "1"))       # 1 isolated, 2 cross
@@ -164,7 +164,7 @@ def mexc_get_private(path: str, params=None):
     if not MEXC_ACCESS_KEY or not MEXC_SECRET_KEY:
         return {
             "ok": False,
-            "error": "MEXC_ACCESS_KEY or MEXC_SECRET_KEY missing in Render environment variables",
+            "error": "MEXC_ACCESS_KEY or MEXC_SECRET_KEY missing in VPS environment variables",
         }
 
     params = params or {}
@@ -183,13 +183,13 @@ def mexc_get_private(path: str, params=None):
         url += "?" + query_string
 
     headers = {
-    "ApiKey": MEXC_ACCESS_KEY,
-    "Request-Time": request_time,
-    "Signature": signature,
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0 V6T-Render-Bot/1.0",
-    "Recv-Window": "30000",
+        "ApiKey": MEXC_ACCESS_KEY,
+        "Request-Time": request_time,
+        "Signature": signature,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 V6T-VPS-Bot/1.0",
+        "Recv-Window": "30000",
     }
 
     req = urllib.request.Request(url, headers=headers, method="GET")
@@ -227,7 +227,7 @@ def mexc_post_private(path: str, body: dict):
     if not MEXC_ACCESS_KEY or not MEXC_SECRET_KEY:
         return {
             "ok": False,
-            "error": "MEXC_ACCESS_KEY or MEXC_SECRET_KEY missing in Render environment variables",
+            "error": "MEXC_ACCESS_KEY or MEXC_SECRET_KEY missing in VPS environment variables",
         }
 
     body_string = json.dumps(body, separators=(",", ":"))
@@ -242,6 +242,8 @@ def mexc_post_private(path: str, body: dict):
         "Request-Time": request_time,
         "Signature": signature,
         "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 V6T-VPS-Bot/1.0",
         "Recv-Window": "30000",
     }
 
@@ -348,6 +350,11 @@ def validate_entry_payload(payload: dict):
 
 
 def build_mexc_entry_order(payload: dict):
+    """
+    Builds a MEXC market entry order WITH attached SL/TP.
+    This currently fails because MEXC rejects the attached stop-limit/TP fields.
+    Kept for later SL/TP debugging.
+    """
     validated = validate_entry_payload(payload)
 
     qty = validated["qty"]
@@ -380,11 +387,57 @@ def build_mexc_entry_order(payload: dict):
             "min_order_vol": MIN_ORDER_VOL,
             "max_order_vol": MAX_ORDER_VOL,
             "geometry_checked": True,
+            "attached_sl_tp": True,
         },
         "warnings": [
-            "DRY RUN ONLY unless this is called by /manual-live-test with LIVE_TRADING_ENABLED=true.",
-            "MEXC vol unit has been visually checked from the trading panel for BTC_USDT.",
-            "Verify MEXC account is isolated margin and one-way mode before live execution.",
+            "This attaches SL/TP and may fail with MEXC code 5003.",
+            "Use /manual-entry-only-test for entry-only plumbing test.",
+        ],
+    }
+
+
+def build_mexc_entry_only_order(payload: dict):
+    """
+    Builds a MEXC market entry order with NO attached SL/TP.
+
+    This is for tiny manual plumbing tests only.
+    You must manually close the position after confirming it opened.
+    """
+    validated = validate_entry_payload(payload)
+
+    qty = validated["qty"]
+    base_action = validated["base_action"]
+
+    side = 1 if base_action == "LONG_ENTRY" else 3
+
+    external_oid = "v6t_entry_only_" + str(uuid.uuid4()).replace("-", "")[:18]
+
+    order_body = {
+        "symbol": MEXC_CONTRACT_SYMBOL,
+        "price": 0,
+        "vol": qty,
+        "leverage": MEXC_LEVERAGE,
+        "side": side,
+        "type": MEXC_ORDER_TYPE,
+        "openType": MEXC_OPEN_TYPE,
+        "externalOid": external_oid,
+        "positionMode": MEXC_POSITION_MODE,
+    }
+
+    return {
+        "order_body": order_body,
+        "validation": {
+            "passed": True,
+            "min_order_vol": MIN_ORDER_VOL,
+            "max_order_vol": MAX_ORDER_VOL,
+            "max_manual_test_vol": MAX_MANUAL_TEST_VOL,
+            "entry_only": True,
+            "attached_sl_tp": False,
+        },
+        "warnings": [
+            "ENTRY ONLY: no SL/TP will be attached.",
+            "Use only for tiny manual test.",
+            "Manually close the position immediately after confirming it opened.",
         ],
     }
 
@@ -741,6 +794,7 @@ def health_check():
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
         "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
+        "mexc_base_url": MEXC_CONTRACT_BASE_URL,
         "mexc_leverage": MEXC_LEVERAGE,
         "mexc_open_type": MEXC_OPEN_TYPE,
         "mexc_order_type": MEXC_ORDER_TYPE,
@@ -774,6 +828,7 @@ def mexc_open_positions(request: Request):
         "received_at_utc": utc_now(),
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
+        "mexc_base_url": MEXC_CONTRACT_BASE_URL,
         "result": result,
     }))
 
@@ -781,6 +836,7 @@ def mexc_open_positions(request: Request):
         "status": "ok",
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
+        "mexc_base_url": MEXC_CONTRACT_BASE_URL,
         "mexc_result": result,
     }
 
@@ -902,10 +958,10 @@ def dry_run_order(request: Request):
     }
 
 
-@app.get("/manual-live-test")
-def manual_live_test(request: Request):
+@app.get("/manual-entry-only-test")
+def manual_entry_only_test(request: Request):
     """
-    Controlled one-off live order test.
+    Controlled one-off live market entry test with NO attached SL/TP.
 
     Required query params:
     - secret
@@ -915,9 +971,110 @@ def manual_live_test(request: Request):
     - stop
     - target
     - confirm=I_UNDERSTAND_THIS_PLACES_A_LIVE_ORDER
+    """
+    secret = request.query_params.get("secret")
+    side = request.query_params.get("side", "").lower()
+    confirm = request.query_params.get("confirm")
 
-    Example:
-    /manual-live-test?secret=...&side=long&qty=0.001&price=79000&stop=78210&target=80659&confirm=I_UNDERSTAND_THIS_PLACES_A_LIVE_ORDER
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    if confirm != MANUAL_LIVE_CONFIRM_PHRASE:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing or incorrect confirmation phrase. This endpoint can place a live entry-only order."
+        )
+
+    if not LIVE_TRADING_ENABLED:
+        return {
+            "status": "blocked",
+            "reason": "LIVE_TRADING_ENABLED=false",
+            "live_order_sent": False,
+        }
+
+    if side not in {"long", "short"}:
+        raise HTTPException(status_code=400, detail="side must be long or short")
+
+    qty = to_float(request.query_params.get("qty"), "qty")
+    price = to_float(request.query_params.get("price"), "price")
+    stop = to_float(request.query_params.get("stop"), "stop")
+    target = to_float(request.query_params.get("target"), "target")
+
+    if qty > MAX_MANUAL_TEST_VOL:
+        return {
+            "status": "blocked",
+            "reason": f"qty {qty} exceeds MAX_MANUAL_TEST_VOL {MAX_MANUAL_TEST_VOL}",
+            "live_order_sent": False,
+        }
+
+    simulated_action = "LONG_ENTRY" if side == "long" else "SHORT_ENTRY"
+
+    payload = {
+        "symbol": EXPECTED_SYMBOL,
+        "action": simulated_action,
+        "side": side.upper(),
+        "price": price,
+        "stop": stop,
+        "target": target,
+        "qty": qty,
+        "time": None,
+        "timeframe": EXPECTED_TIMEFRAME,
+    }
+
+    mexc_snapshot = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+    entry_guard = run_entry_guard(
+        payload,
+        is_test=False,
+        mexc_position_snapshot=mexc_snapshot
+    )
+
+    if not entry_guard["guard_passed"] or not entry_guard["would_enter"]:
+        return {
+            "status": "blocked",
+            "reason": "entry guard blocked manual entry-only test",
+            "entry_guard": entry_guard,
+            "live_order_sent": False,
+        }
+
+    try:
+        proposed_order = build_mexc_entry_only_order(payload)
+    except Exception as e:
+        return {
+            "status": "blocked",
+            "reason": f"failed to build entry-only order: {str(e)}",
+            "live_order_sent": False,
+        }
+
+    live_order_result = place_live_order_only_if_armed(proposed_order["order_body"])
+
+    event = {
+        "event": "manual_entry_only_test",
+        "received_at_utc": utc_now(),
+        "payload": payload,
+        "entry_guard": entry_guard,
+        "proposed_order": proposed_order,
+        "live_order_result": live_order_result,
+    }
+
+    print(json.dumps(event))
+
+    return {
+        "status": "ok",
+        "payload": payload,
+        "entry_guard": entry_guard,
+        "proposed_order": proposed_order,
+        "live_order_result": live_order_result,
+        "warning": "ENTRY ONLY: no SL/TP attached. Manually close immediately."
+    }
+
+
+@app.get("/manual-live-test")
+def manual_live_test(request: Request):
+    """
+    Controlled one-off live order test WITH attached SL/TP.
+
+    This currently may fail with MEXC code 5003.
+    Use /manual-entry-only-test first to prove base order placement.
     """
     secret = request.query_params.get("secret")
     side = request.query_params.get("side", "").lower()
