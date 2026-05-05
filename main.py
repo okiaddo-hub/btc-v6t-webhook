@@ -364,7 +364,7 @@ def build_mexc_entry_order(payload: dict):
 
     side = 1 if base_action == "LONG_ENTRY" else 3
 
-    external_oid = "v6t_" + str(uuid.uuid4()).replace("-", "")[:24]
+    external_oid = "v6t" + str(uuid.uuid4()).replace("-", "")[:20]
 
     order_body = {
         "symbol": MEXC_CONTRACT_SYMBOL,
@@ -410,7 +410,7 @@ def build_mexc_entry_only_order(payload: dict):
 
     side = 1 if base_action == "LONG_ENTRY" else 3
 
-    external_oid = "v6t_entry_only_" + str(uuid.uuid4()).replace("-", "")[:18]
+    external_oid = "v6t" + str(uuid.uuid4()).replace("-", "")[:20]
 
     order_body = {
         "symbol": MEXC_CONTRACT_SYMBOL,
