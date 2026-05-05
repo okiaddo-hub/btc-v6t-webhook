@@ -33,10 +33,37 @@ AUTO_TV_EXECUTION_ENABLED = os.getenv("AUTO_TV_EXECUTION_ENABLED", "false").lowe
 MEXC_CONTRACT_SYMBOL = os.getenv("MEXC_CONTRACT_SYMBOL", "BTC_USDT")
 MEXC_CONTRACT_BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://api.mexc.com")
 
+# Current documented MEXC Futures order endpoint:
+# POST /api/v1/private/order/create
+MEXC_ORDER_CREATE_PATH = os.getenv(
+    "MEXC_ORDER_CREATE_PATH",
+    "/api/v1/private/order/create"
+)
+
 MEXC_LEVERAGE = int(os.getenv("MEXC_LEVERAGE", "4"))
 MEXC_OPEN_TYPE = int(os.getenv("MEXC_OPEN_TYPE", "1"))       # 1 isolated, 2 cross
 MEXC_ORDER_TYPE = int(os.getenv("MEXC_ORDER_TYPE", "5"))     # 5 market order
+
+# MEXC docs:
+# positionMode:
+# 1 = dual-side / hedge
+# 2 = one-way
+#
+# Your previous entry-only order worked with the current setup,
+# so this preserves your current default of 2.
 MEXC_POSITION_MODE = int(os.getenv("MEXC_POSITION_MODE", "2"))
+
+# TP/SL trigger price type:
+# 1 = latest price
+# 2 = fair price
+# 3 = index price
+MEXC_SL_PRICE_TYPE = int(os.getenv("MEXC_SL_PRICE_TYPE", "1"))
+MEXC_TP_PRICE_TYPE = int(os.getenv("MEXC_TP_PRICE_TYPE", "1"))
+
+# Trigger protection:
+# 0 = disabled
+# 1 = enabled
+MEXC_PRICE_PROTECT = int(os.getenv("MEXC_PRICE_PROTECT", "0"))
 
 # BTC_USDT contract detail from MEXC:
 # contractSize = 0.0001 BTC
@@ -337,6 +364,27 @@ def get_mexc_open_positions(symbol=None):
     )
 
 
+def get_mexc_open_stop_orders(symbol=None):
+    """
+    Inspect current unfinished TP/SL stop orders.
+
+    This helps confirm whether attached SL/TP was actually created.
+    """
+    params = {
+        "is_finished": 0,
+        "page_num": 1,
+        "page_size": 20,
+    }
+
+    if symbol:
+        params["symbol"] = symbol
+
+    return mexc_get_private(
+        "/api/v1/private/stoporder/list/orders",
+        params=params
+    )
+
+
 # =====================================================
 # Order validation and order builder
 # =====================================================
@@ -396,10 +444,13 @@ def build_mexc_entry_order(payload: dict):
     """
     Builds a MEXC market entry order WITH attached SL/TP.
 
-    NOTE:
-    MEXC previously rejected attached SL/TP with code 5003.
-    This function now converts BTC qty to MEXC contract vol correctly,
-    but attached SL/TP may still need separate MEXC plan-order handling.
+    Important MEXC format points:
+    - Current documented order endpoint is /api/v1/private/order/create.
+    - type=5 means market.
+    - price is still sent as 0.
+    - vol is contract count, not BTC amount.
+    - stopLossPrice and takeProfitPrice are attached directly.
+    - lossTrend/profitTrend are sent explicitly.
     """
     validated = validate_entry_payload(payload)
 
@@ -423,9 +474,14 @@ def build_mexc_entry_order(payload: dict):
         "type": MEXC_ORDER_TYPE,
         "openType": MEXC_OPEN_TYPE,
         "externalOid": external_oid,
+        "positionMode": MEXC_POSITION_MODE,
+
+        # Attached TP/SL fields
         "stopLossPrice": stop,
         "takeProfitPrice": target,
-        "positionMode": MEXC_POSITION_MODE,
+        "lossTrend": MEXC_SL_PRICE_TYPE,
+        "profitTrend": MEXC_TP_PRICE_TYPE,
+        "priceProtect": MEXC_PRICE_PROTECT,
     }
 
     return {
@@ -441,10 +497,14 @@ def build_mexc_entry_order(payload: dict):
             "max_order_vol_btc": MAX_ORDER_VOL,
             "geometry_checked": True,
             "attached_sl_tp": True,
+            "lossTrend": MEXC_SL_PRICE_TYPE,
+            "profitTrend": MEXC_TP_PRICE_TYPE,
+            "priceProtect": MEXC_PRICE_PROTECT,
+            "mexc_order_path": MEXC_ORDER_CREATE_PATH,
         },
         "warnings": [
-            "This attaches SL/TP and may fail with MEXC code 5003.",
-            "Use /manual-entry-only-test for entry-only plumbing test.",
+            "This attempts attached SL/TP at entry using /api/v1/private/order/create.",
+            "If MEXC still returns 5003, fallback is entry first, then /api/v1/private/stoporder/place.",
         ],
     }
 
@@ -493,6 +553,7 @@ def build_mexc_entry_only_order(payload: dict):
             "max_manual_test_vol_btc": MAX_MANUAL_TEST_VOL,
             "entry_only": True,
             "attached_sl_tp": False,
+            "mexc_order_path": MEXC_ORDER_CREATE_PATH,
         },
         "warnings": [
             "ENTRY ONLY: no SL/TP will be attached.",
@@ -520,9 +581,10 @@ def place_live_order_only_if_armed(order_body: dict):
 
     return {
         "live_order_sent": True,
-        "reason": "LIVE_TRADING_ENABLED=true - submitting order to MEXC",
+        "reason": f"LIVE_TRADING_ENABLED=true - submitting order to MEXC path {MEXC_ORDER_CREATE_PATH}",
+        "mexc_order_path": MEXC_ORDER_CREATE_PATH,
         "mexc_response": mexc_post_private(
-            "/api/v1/private/order/submit",
+            MEXC_ORDER_CREATE_PATH,
             order_body
         ),
     }
@@ -855,11 +917,16 @@ def health_check():
         "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
         "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
         "mexc_base_url": MEXC_CONTRACT_BASE_URL,
+        "mexc_order_create_path": MEXC_ORDER_CREATE_PATH,
         "mexc_contract_size": MEXC_CONTRACT_SIZE,
         "mexc_min_contract_vol": MEXC_MIN_CONTRACT_VOL,
         "mexc_leverage": MEXC_LEVERAGE,
         "mexc_open_type": MEXC_OPEN_TYPE,
         "mexc_order_type": MEXC_ORDER_TYPE,
+        "mexc_position_mode": MEXC_POSITION_MODE,
+        "mexc_sl_price_type": MEXC_SL_PRICE_TYPE,
+        "mexc_tp_price_type": MEXC_TP_PRICE_TYPE,
+        "mexc_price_protect": MEXC_PRICE_PROTECT,
         "min_order_vol_btc": MIN_ORDER_VOL,
         "max_order_vol_btc": MAX_ORDER_VOL,
         "max_manual_test_vol_btc": MAX_MANUAL_TEST_VOL,
@@ -899,6 +966,33 @@ def mexc_open_positions(request: Request):
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
         "mexc_base_url": MEXC_CONTRACT_BASE_URL,
+        "mexc_result": result,
+    }
+
+
+@app.get("/mexc-open-stop-orders")
+def mexc_open_stop_orders(request: Request):
+    """
+    Checks unfinished TP/SL stop orders.
+    Useful immediately after /manual-live-test.
+    """
+    secret = request.query_params.get("secret")
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    result = get_mexc_open_stop_orders(MEXC_CONTRACT_SYMBOL)
+
+    print(json.dumps({
+        "event": "mexc_open_stop_orders_check",
+        "received_at_utc": utc_now(),
+        "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
+        "result": result,
+    }))
+
+    return {
+        "status": "ok",
+        "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
         "mexc_result": result,
     }
 
@@ -972,9 +1066,23 @@ def entry_guard_test(request: Request):
 
 @app.get("/dry-run-order")
 def dry_run_order(request: Request):
+    """
+    Dry-run attached SL/TP order. Never submits to MEXC.
+
+    Query params:
+    - secret
+    - side=long or short
+    - qty=0.001
+    - price=current reference price
+    - stop=SL price
+    - target=TP price
+    """
     secret = request.query_params.get("secret")
     side = request.query_params.get("side", "long").lower()
     qty_param = request.query_params.get("qty")
+    price_param = request.query_params.get("price")
+    stop_param = request.query_params.get("stop")
+    target_param = request.query_params.get("target")
 
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
@@ -984,17 +1092,26 @@ def dry_run_order(request: Request):
 
     simulated_action = "LONG_ENTRY" if side == "long" else "SHORT_ENTRY"
 
-    simulated_qty = 0.001
-    if qty_param is not None:
-        simulated_qty = to_float(qty_param, "qty")
+    simulated_qty = 0.001 if qty_param is None else to_float(qty_param, "qty")
+    simulated_price = 78000 if price_param is None else to_float(price_param, "price")
+
+    if stop_param is None:
+        simulated_stop = simulated_price * 0.99 if side == "long" else simulated_price * 1.01
+    else:
+        simulated_stop = to_float(stop_param, "stop")
+
+    if target_param is None:
+        simulated_target = simulated_price * 1.02 if side == "long" else simulated_price * 0.98
+    else:
+        simulated_target = to_float(target_param, "target")
 
     simulated_payload = {
         "symbol": EXPECTED_SYMBOL,
         "action": simulated_action,
         "side": side.upper(),
-        "price": 78000,
-        "stop": 77220 if side == "long" else 78780,
-        "target": 79638 if side == "long" else 76362,
+        "price": simulated_price,
+        "stop": simulated_stop,
+        "target": simulated_target,
         "qty": simulated_qty,
         "time": None,
         "timeframe": EXPECTED_TIMEFRAME,
@@ -1135,8 +1252,14 @@ def manual_live_test(request: Request):
     """
     Controlled one-off live order test WITH attached SL/TP.
 
-    This currently may fail with MEXC code 5003.
-    Use /manual-entry-only-test first to prove base order placement.
+    Required query params:
+    - secret
+    - side=long or short
+    - qty
+    - price
+    - stop
+    - target
+    - confirm=I_UNDERSTAND_THIS_PLACES_A_LIVE_ORDER
     """
     secret = request.query_params.get("secret")
     side = request.query_params.get("side", "").lower()
@@ -1230,6 +1353,7 @@ def manual_live_test(request: Request):
         "entry_guard": entry_guard,
         "proposed_order": proposed_order,
         "live_order_result": live_order_result,
+        "next_check": "If success=true, immediately check /mexc-open-positions and /mexc-open-stop-orders.",
     }
 
 
