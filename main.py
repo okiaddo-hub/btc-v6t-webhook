@@ -703,6 +703,31 @@ def build_mexc_entry_only_order(payload: dict):
     validated = validate_entry_payload(payload)
 
     qty_btc = validated["qty"]
+    sizing_result = None
+    sizing_mode = "PINE_QTY"
+
+    # Safe preview/dry-run support:
+    # If TradingView sends qty:null and backend sizing is enabled, calculate the
+    # final BTC qty here instead of failing inside btc_qty_to_mexc_vol().
+    if qty_btc is None and USE_BACKEND_BALANCE_SIZING:
+        risk_pct_raw = payload.get("riskPct", payload.get("risk_pct", None))
+        risk_pct = None if risk_pct_raw in [None, "", "null"] else to_float(risk_pct_raw, "riskPct")
+
+        sizing_result = calculate_backend_position_size(
+            price=validated["price"],
+            stop=validated["stop"],
+            risk_pct=risk_pct,
+        )
+
+        if not sizing_result.get("ok"):
+            raise ValueError(f"backend sizing failed: {sizing_result.get('reason', sizing_result)}")
+
+        qty_btc = sizing_result["final_qty_btc"]
+        sizing_mode = "BACKEND_BALANCE"
+
+    if qty_btc is None:
+        raise ValueError("qty is missing and backend balance sizing is not available")
+
     mexc_vol = btc_qty_to_mexc_vol(qty_btc)
     base_action = validated["base_action"]
     side = 1 if base_action == "LONG_ENTRY" else 3
@@ -725,6 +750,14 @@ def build_mexc_entry_only_order(payload: dict):
             "input_qty_btc": qty_btc,
             "mexc_contract_size": MEXC_CONTRACT_SIZE,
             "mexc_vol_contracts": mexc_vol,
+        },
+        "sizing": {
+            "sizing_mode": sizing_mode,
+            "use_backend_balance_sizing": USE_BACKEND_BALANCE_SIZING,
+            "pine_qty_btc": validated.get("qty"),
+            "final_qty_btc": qty_btc,
+            "backend_sizing_result": sizing_result,
+            "max_order_vol_btc": MAX_ORDER_VOL,
         },
         "validation": {
             "passed": True,
