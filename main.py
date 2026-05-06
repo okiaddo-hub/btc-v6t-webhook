@@ -61,7 +61,6 @@ ALLOW_ALERT_RISK_PCT = os.getenv("ALLOW_ALERT_RISK_PCT", "false").lower() == "tr
 MEXC_CONTRACT_SIZE = float(os.getenv("MEXC_CONTRACT_SIZE", "0.0001"))
 MEXC_MIN_CONTRACT_VOL = int(os.getenv("MEXC_MIN_CONTRACT_VOL", "1"))
 
-MAX_ORDER_VOL = float(os.getenv("MAX_ORDER_VOL", "0.02"))          # BTC qty
 MIN_ORDER_VOL = float(os.getenv("MIN_ORDER_VOL", "0.0001"))        # BTC qty
 MAX_MANUAL_TEST_VOL = float(os.getenv("MAX_MANUAL_TEST_VOL", "0.001"))
 
@@ -524,7 +523,6 @@ def calculate_backend_position_size(price: float, stop: float, risk_pct: float =
         "notional_cap_qty_btc": notional_cap_qty_btc,
         "final_uncorrected_qty_btc": final_uncorrected_qty_btc,
         "limiting_factors": limiting_factors,
-        "legacy_max_order_vol_btc": MAX_ORDER_VOL,
         "min_order_vol_btc": MIN_ORDER_VOL,
     }
 
@@ -773,8 +771,6 @@ def validate_entry_payload(payload: dict):
         if qty < MIN_ORDER_VOL:
             raise ValueError(f"qty {qty} is below MIN_ORDER_VOL {MIN_ORDER_VOL}")
 
-        if qty > MAX_ORDER_VOL:
-            raise ValueError(f"qty {qty} exceeds MAX_ORDER_VOL {MAX_ORDER_VOL}")
 
     if stop <= 0:
         raise ValueError(f"stop must be > 0, got {stop}")
@@ -862,8 +858,7 @@ def build_mexc_entry_only_order(payload: dict):
             "pine_qty_btc": validated.get("qty"),
             "final_qty_btc": qty_btc,
             "backend_sizing_result": sizing_result,
-            "legacy_max_order_vol_btc": MAX_ORDER_VOL,
-        },
+            },
         "validation": {
             "passed": True,
             "max_manual_test_vol_btc": MAX_MANUAL_TEST_VOL,
@@ -1007,8 +1002,6 @@ def validate_trail_update_payload(payload: dict):
         raise ValueError(f"stop must be > 0, got {stop}")
     if target is not None and target <= 0:
         raise ValueError(f"target must be > 0, got {target}")
-    if qty is not None and qty > MAX_ORDER_VOL:
-        raise ValueError(f"qty {qty} exceeds MAX_ORDER_VOL {MAX_ORDER_VOL}")
 
     if base_action == "LONG_TRAIL_UPDATE":
         if not stop < price:
@@ -1172,7 +1165,6 @@ def entry_then_sltp_workflow(payload: dict):
         "final_qty_btc": qty_btc,
         "mexc_vol_contracts": mexc_vol,
         "backend_sizing_result": sizing_result,
-        "max_order_vol_btc": MAX_ORDER_VOL,
     }
 
     entry_result = place_live_order_only_if_armed(proposed_entry["order_body"])
@@ -2109,8 +2101,9 @@ def health_check():
         "min_stop_distance_pct": MIN_STOP_DISTANCE_PCT,
         "allow_alert_risk_pct": ALLOW_ALERT_RISK_PCT,
         "backend_sizing_dry_run_available": True,
+        "max_order_vol_removed": True,
+        "position_size_caps": "risk_pct + dynamic_size_cap_multiplier + max_notional_multiple_of_balance + min_stop_distance_pct",
         "min_order_vol_btc": MIN_ORDER_VOL,
-        "legacy_max_order_vol_btc": MAX_ORDER_VOL,
         "max_manual_test_vol_btc": MAX_MANUAL_TEST_VOL,
         "entry_settle_wait_seconds": ENTRY_SETTLE_WAIT_SECONDS,
         "state_file_path": STATE_FILE_PATH,
