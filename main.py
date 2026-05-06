@@ -44,6 +44,10 @@ MEXC_SL_PRICE_TYPE = int(os.getenv("MEXC_SL_PRICE_TYPE", "1"))  # 1 latest
 MEXC_TP_PRICE_TYPE = int(os.getenv("MEXC_TP_PRICE_TYPE", "1"))  # 1 latest
 MEXC_PRICE_PROTECT = int(os.getenv("MEXC_PRICE_PROTECT", "0"))
 
+MEXC_BALANCE_CURRENCY = os.getenv("MEXC_BALANCE_CURRENCY", "USDT")
+BACKEND_RISK_PCT = float(os.getenv("BACKEND_RISK_PCT", "1.0"))
+BALANCE_SAFETY_MULTIPLIER = float(os.getenv("BALANCE_SAFETY_MULTIPLIER", "0.95"))
+
 MEXC_CONTRACT_SIZE = float(os.getenv("MEXC_CONTRACT_SIZE", "0.0001"))
 MEXC_MIN_CONTRACT_VOL = int(os.getenv("MEXC_MIN_CONTRACT_VOL", "1"))
 
@@ -317,6 +321,156 @@ def get_mexc_open_stop_orders(symbol=None, position_id=None):
         params["positionId"] = position_id
 
     return mexc_get_private("/api/v1/private/stoporder/list/orders", params=params)
+
+
+def get_mexc_account_assets():
+    return mexc_get_private("/api/v1/private/account/assets")
+
+
+def get_mexc_single_asset(currency="USDT"):
+    safe_currency = urllib.parse.quote(str(currency).upper())
+    return mexc_get_private(f"/api/v1/private/account/asset/{safe_currency}")
+
+
+def extract_asset_record(mexc_result: dict, currency="USDT"):
+    currency = str(currency).upper()
+
+    if not mexc_result.get("ok"):
+        return None, f"MEXC request failed: {mexc_result}"
+
+    data_wrapper = mexc_result.get("data", {})
+    if not isinstance(data_wrapper, dict):
+        return None, f"Unexpected MEXC response format: {data_wrapper}"
+
+    if not data_wrapper.get("success"):
+        return None, f"MEXC success=false: {data_wrapper}"
+
+    data = data_wrapper.get("data")
+
+    if isinstance(data, dict):
+        if str(data.get("currency", "")).upper() == currency:
+            return data, None
+        return None, f"Returned asset is not {currency}: {data}"
+
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("currency", "")).upper() == currency:
+                return item, None
+        return None, f"No {currency} asset found in returned assets"
+
+    return None, f"Unexpected asset data format: {data}"
+
+
+def choose_balance_for_sizing(asset: dict):
+    """
+    Prefer availableOpen because it is intended to represent usable balance for opening positions.
+    Fall back to availableBalance, then equity.
+    """
+    for key in ["availableOpen", "availableBalance", "equity"]:
+        value = asset.get(key)
+        if value is not None:
+            try:
+                numeric = float(value)
+                return numeric, key
+            except Exception:
+                pass
+
+    return None, None
+
+
+def calculate_backend_position_size(price: float, stop: float, risk_pct: float = None):
+    """
+    Dry-run backend sizing only. No order is placed here.
+
+    Formula:
+    risk_amount_usdt = effective_balance * risk_pct
+    stop_distance_usdt = abs(price - stop)
+    qty_btc_by_risk = risk_amount_usdt / stop_distance_usdt
+    max_qty_by_leverage = effective_balance * leverage / price
+    final qty is capped by risk, leverage, and MAX_ORDER_VOL.
+    """
+    price = float(price)
+    stop = float(stop)
+
+    if price <= 0:
+        raise ValueError("price must be > 0")
+
+    if stop <= 0:
+        raise ValueError("stop must be > 0")
+
+    stop_distance = abs(price - stop)
+
+    if stop_distance <= 0:
+        raise ValueError("stop distance must be > 0")
+
+    risk_pct = BACKEND_RISK_PCT if risk_pct is None else float(risk_pct)
+
+    asset_result = get_mexc_single_asset(MEXC_BALANCE_CURRENCY)
+    asset, asset_error = extract_asset_record(asset_result, MEXC_BALANCE_CURRENCY)
+
+    if asset_error:
+        return {
+            "ok": False,
+            "reason": asset_error,
+            "mexc_asset_result": asset_result,
+        }
+
+    raw_balance, balance_source = choose_balance_for_sizing(asset)
+
+    if raw_balance is None:
+        return {
+            "ok": False,
+            "reason": "Could not extract usable balance from MEXC asset record",
+            "asset": asset,
+        }
+
+    effective_balance = raw_balance * BALANCE_SAFETY_MULTIPLIER
+    risk_amount = effective_balance * (risk_pct / 100.0)
+
+    qty_btc_by_risk = risk_amount / stop_distance
+    max_qty_by_leverage = (effective_balance * MEXC_LEVERAGE) / price
+
+    uncapped_qty_btc = min(qty_btc_by_risk, max_qty_by_leverage)
+    capped_qty_btc = min(uncapped_qty_btc, MAX_ORDER_VOL)
+
+    result_common = {
+        "asset": asset,
+        "balance_currency": MEXC_BALANCE_CURRENCY,
+        "balance_source": balance_source,
+        "raw_balance": raw_balance,
+        "balance_safety_multiplier": BALANCE_SAFETY_MULTIPLIER,
+        "effective_balance": effective_balance,
+        "risk_pct": risk_pct,
+        "risk_amount": risk_amount,
+        "price": price,
+        "stop": stop,
+        "stop_distance": stop_distance,
+        "qty_btc_by_risk": qty_btc_by_risk,
+        "max_qty_by_leverage": max_qty_by_leverage,
+        "uncapped_qty_btc": uncapped_qty_btc,
+        "capped_qty_btc": capped_qty_btc,
+        "max_order_vol_btc": MAX_ORDER_VOL,
+        "min_order_vol_btc": MIN_ORDER_VOL,
+    }
+
+    if capped_qty_btc < MIN_ORDER_VOL:
+        return {
+            "ok": False,
+            "reason": f"Calculated qty {capped_qty_btc} is below MIN_ORDER_VOL {MIN_ORDER_VOL}",
+            **result_common,
+        }
+
+    mexc_vol = btc_qty_to_mexc_vol(capped_qty_btc)
+    final_qty_btc = mexc_vol * MEXC_CONTRACT_SIZE
+
+    return {
+        "ok": True,
+        **result_common,
+        "final_qty_btc": final_qty_btc,
+        "mexc_contract_size": MEXC_CONTRACT_SIZE,
+        "mexc_vol_contracts": mexc_vol,
+        "note": "Dry-run only. Live execution still uses current entry workflow until backend sizing is explicitly enabled.",
+    }
 
 
 # =====================================================
@@ -1730,6 +1884,10 @@ def health_check():
         "mexc_sl_price_type": MEXC_SL_PRICE_TYPE,
         "mexc_tp_price_type": MEXC_TP_PRICE_TYPE,
         "mexc_price_protect": MEXC_PRICE_PROTECT,
+        "mexc_balance_currency": MEXC_BALANCE_CURRENCY,
+        "backend_risk_pct": BACKEND_RISK_PCT,
+        "balance_safety_multiplier": BALANCE_SAFETY_MULTIPLIER,
+        "backend_sizing_dry_run_available": True,
         "min_order_vol_btc": MIN_ORDER_VOL,
         "max_order_vol_btc": MAX_ORDER_VOL,
         "max_manual_test_vol_btc": MAX_MANUAL_TEST_VOL,
@@ -1844,6 +2002,82 @@ def reset_state(request: Request):
         "paper_state": paper_state,
         "live_state": live_state,
     }
+
+
+@app.get("/mexc-account-assets")
+def mexc_account_assets(request: Request):
+    secret = request.query_params.get("secret")
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    result = get_mexc_account_assets()
+
+    return {
+        "status": "ok",
+        "mexc_result": result,
+    }
+
+
+@app.get("/mexc-futures-balance")
+def mexc_futures_balance(request: Request):
+    secret = request.query_params.get("secret")
+    currency = request.query_params.get("currency", MEXC_BALANCE_CURRENCY)
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    result = get_mexc_single_asset(currency)
+    asset, asset_error = extract_asset_record(result, currency)
+
+    if asset_error:
+        return {
+            "status": "error",
+            "reason": asset_error,
+            "mexc_result": result,
+        }
+
+    raw_balance, balance_source = choose_balance_for_sizing(asset)
+
+    return {
+        "status": "ok",
+        "currency": str(currency).upper(),
+        "asset": asset,
+        "balance_source_for_sizing": balance_source,
+        "raw_balance_for_sizing": raw_balance,
+        "balance_safety_multiplier": BALANCE_SAFETY_MULTIPLIER,
+        "effective_balance_for_sizing": None if raw_balance is None else raw_balance * BALANCE_SAFETY_MULTIPLIER,
+    }
+
+
+@app.get("/dry-run-backend-size")
+def dry_run_backend_size(request: Request):
+    secret = request.query_params.get("secret")
+    price = request.query_params.get("price")
+    stop = request.query_params.get("stop")
+    risk_pct = request.query_params.get("risk_pct")
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    if price is None or stop is None:
+        raise HTTPException(status_code=400, detail="price and stop are required")
+
+    try:
+        result = calculate_backend_position_size(
+            price=to_float(price, "price"),
+            stop=to_float(stop, "stop"),
+            risk_pct=None if risk_pct in [None, "", "null"] else to_float(risk_pct, "risk_pct"),
+        )
+        return {
+            "status": "ok" if result.get("ok") else "blocked",
+            "sizing_result": result,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "reason": str(e),
+        }
 
 
 @app.get("/mexc-open-positions")
