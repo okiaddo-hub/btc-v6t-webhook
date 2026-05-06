@@ -30,6 +30,10 @@ MEXC_CONTRACT_BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://api.mexc.c
 
 MEXC_ORDER_CREATE_PATH = os.getenv("MEXC_ORDER_CREATE_PATH", "/api/v1/private/order/create")
 MEXC_STOP_ORDER_PLACE_PATH = os.getenv("MEXC_STOP_ORDER_PLACE_PATH", "/api/v1/private/stoporder/place")
+MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH = os.getenv(
+    "MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH",
+    "/api/v1/private/stoporder/change_plan_price"
+)
 
 MEXC_LEVERAGE = int(os.getenv("MEXC_LEVERAGE", "4"))
 MEXC_OPEN_TYPE = int(os.getenv("MEXC_OPEN_TYPE", "1"))       # 1 isolated, 2 cross
@@ -619,6 +623,108 @@ def build_position_sltp_order(position_id, mexc_vol: int, stop: float, target: f
     return body
 
 
+def get_stop_plan_order_id_from_orders(stop_orders):
+    """
+    MEXC's /stoporder/change_plan_price endpoint uses stopPlanOrderId.
+    In /stoporder/list/orders, that value appears as the stop order object's "id".
+    """
+    if not isinstance(stop_orders, list):
+        return None
+
+    for order in stop_orders:
+        if not isinstance(order, dict):
+            continue
+        value = order.get("id", order.get("stopPlanOrderId", order.get("stop_plan_order_id")))
+        if value not in [None, "", 0, "0"]:
+            return value
+
+    return None
+
+
+def build_change_plan_price_order(stop_plan_order_id, stop: float = None, target: float = None):
+    """
+    Builds body for:
+    POST /api/v1/private/stoporder/change_plan_price
+
+    Required:
+    - stopPlanOrderId
+    - at least one of stopLossPrice / takeProfitPrice must be > 0
+
+    We send both prices during trail updates so TP remains explicitly preserved.
+    """
+    if stop_plan_order_id in [None, "", 0, "0"]:
+        raise ValueError("stopPlanOrderId is required for change_plan_price")
+
+    if stop is None and target is None:
+        raise ValueError("At least one of stopLossPrice or takeProfitPrice is required")
+
+    body = {
+        "stopPlanOrderId": int(stop_plan_order_id),
+        "lossTrend": MEXC_SL_PRICE_TYPE,
+        "profitTrend": MEXC_TP_PRICE_TYPE,
+        "stopLossReverse": 2,
+        "takeProfitReverse": 2,
+    }
+
+    if stop is not None:
+        if float(stop) <= 0:
+            raise ValueError("stopLossPrice must be > 0")
+        body["stopLossPrice"] = float(stop)
+
+    if target is not None:
+        if float(target) <= 0:
+            raise ValueError("takeProfitPrice must be > 0")
+        body["takeProfitPrice"] = float(target)
+
+    return body
+
+
+def validate_trail_update_payload(payload: dict):
+    action = payload.get("action")
+    base_action = clean_action(action)
+
+    if base_action not in {"LONG_TRAIL_UPDATE", "SHORT_TRAIL_UPDATE"}:
+        raise ValueError(f"Cannot validate non-trail action: {action}")
+
+    price = to_float(payload.get("price"), "price")
+    stop = to_float(payload.get("stop"), "stop")
+
+    target_raw = payload.get("target")
+    target = None if target_raw in [None, "", "null"] else to_float(target_raw, "target")
+
+    qty_raw = payload.get("qty")
+    qty = None if qty_raw in [None, "", "null"] else to_float(qty_raw, "qty")
+
+    if price <= 0:
+        raise ValueError(f"price must be > 0, got {price}")
+    if stop <= 0:
+        raise ValueError(f"stop must be > 0, got {stop}")
+    if target is not None and target <= 0:
+        raise ValueError(f"target must be > 0, got {target}")
+    if qty is not None and qty > MAX_ORDER_VOL:
+        raise ValueError(f"qty {qty} exceeds MAX_ORDER_VOL {MAX_ORDER_VOL}")
+
+    if base_action == "LONG_TRAIL_UPDATE":
+        if not stop < price:
+            raise ValueError(f"LONG trail geometry invalid: stop {stop} must be below price {price}")
+        if target is not None and not target > price:
+            raise ValueError(f"LONG trail geometry invalid: target {target} must be above price {price}")
+
+    if base_action == "SHORT_TRAIL_UPDATE":
+        if not stop > price:
+            raise ValueError(f"SHORT trail geometry invalid: stop {stop} must be above price {price}")
+        if target is not None and not target < price:
+            raise ValueError(f"SHORT trail geometry invalid: target {target} must be below price {price}")
+
+    return {
+        "price": price,
+        "stop": stop,
+        "target": target,
+        "qty": qty,
+        "base_action": base_action,
+    }
+
+
 # =====================================================
 # Live order execution helpers
 # =====================================================
@@ -660,6 +766,22 @@ def place_position_sltp_only_if_armed(sltp_body: dict):
         "reason": f"LIVE_TRADING_ENABLED=true - submitting TP/SL to MEXC path {MEXC_STOP_ORDER_PLACE_PATH}",
         "mexc_stop_order_path": MEXC_STOP_ORDER_PLACE_PATH,
         "mexc_response": mexc_post_private(MEXC_STOP_ORDER_PLACE_PATH, sltp_body),
+    }
+
+
+def change_plan_price_only_if_armed(change_body: dict):
+    if not LIVE_TRADING_ENABLED:
+        return {
+            "change_sent": False,
+            "reason": "blocked - LIVE_TRADING_ENABLED=false",
+            "would_send_change": change_body,
+        }
+
+    return {
+        "change_sent": True,
+        "reason": f"LIVE_TRADING_ENABLED=true - modifying TP/SL via {MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH}",
+        "mexc_stop_order_change_plan_price_path": MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH,
+        "mexc_response": mexc_post_private(MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH, change_body),
     }
 
 
@@ -814,6 +936,172 @@ def entry_then_sltp_workflow(payload: dict):
         "matched_stop_orders": matched_stop_orders,
         "state_saved": state,
         "danger": None if sltp_success else "Position is open but SL/TP placement failed. Check MEXC immediately.",
+    }
+
+
+def trail_update_workflow(payload: dict):
+    """
+    Manual trail update workflow:
+    1. read live state
+    2. verify MEXC position is still open
+    3. verify the stop improves
+    4. modify existing TP/SL planned order via change_plan_price
+    5. verify open stop order list
+    6. save updated state
+    """
+    validated = validate_trail_update_payload(payload)
+    base_action = validated["base_action"]
+    new_stop = validated["stop"]
+    new_target = validated["target"]
+
+    live_state = load_live_state()
+
+    if live_state.get("status") not in ["OPEN_WITH_SLTP_PLACED", "OPEN_WITH_SLTP_UPDATED"]:
+        return {
+            "status": "blocked",
+            "reason": f"live state is not an open protected trade: {live_state.get('status')}",
+            "live_state": live_state,
+        }
+
+    state_side = live_state.get("side")
+    expected_action = "LONG_TRAIL_UPDATE" if state_side == "LONG" else "SHORT_TRAIL_UPDATE" if state_side == "SHORT" else None
+
+    if expected_action is None or base_action != expected_action:
+        return {
+            "status": "blocked",
+            "reason": f"trail action {base_action} does not match live state side {state_side}",
+            "live_state": live_state,
+        }
+
+    current_stop = live_state.get("currentStop")
+    current_target = live_state.get("currentTarget")
+
+    if current_stop is None:
+        return {
+            "status": "blocked",
+            "reason": "live state does not contain currentStop",
+            "live_state": live_state,
+        }
+
+    current_stop = float(current_stop)
+    effective_target = float(new_target if new_target is not None else current_target)
+
+    if state_side == "LONG" and not new_stop > current_stop:
+        return {
+            "status": "blocked",
+            "reason": f"LONG stop did not improve: old={current_stop}, new={new_stop}",
+            "live_state": live_state,
+        }
+
+    if state_side == "SHORT" and not new_stop < current_stop:
+        return {
+            "status": "blocked",
+            "reason": f"SHORT stop did not improve: old={current_stop}, new={new_stop}",
+            "live_state": live_state,
+        }
+
+    position_id = live_state.get("positionId")
+    if position_id in [None, "", 0, "0"]:
+        return {
+            "status": "blocked",
+            "reason": "live state does not contain positionId",
+            "live_state": live_state,
+        }
+
+    position_snapshot = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+    matched_position = find_open_position_by_position_id(position_snapshot, position_id)
+
+    if matched_position is None:
+        state_after = save_live_state({
+            **live_state,
+            "status": "TRAIL_UPDATE_BLOCKED_POSITION_NOT_FOUND",
+            "position_snapshot": position_snapshot,
+            "danger": "Local state expected an open position, but MEXC did not show it. Reconcile before continuing.",
+        })
+        return {
+            "status": "blocked",
+            "reason": "MEXC open position not found for saved positionId",
+            "position_snapshot": position_snapshot,
+            "state_after": state_after,
+            "danger": "Run /reconcile-live-state before continuing.",
+        }
+
+    stop_orders_snapshot_before = get_mexc_open_stop_orders(MEXC_CONTRACT_SYMBOL, position_id=position_id)
+    matched_stop_orders_before = stop_orders_for_position(stop_orders_snapshot_before, position_id)
+
+    stop_plan_order_id = get_stop_plan_order_id_from_orders(matched_stop_orders_before)
+
+    if stop_plan_order_id is None:
+        state_after = save_live_state({
+            **live_state,
+            "status": "TRAIL_UPDATE_BLOCKED_STOP_PLAN_ID_MISSING",
+            "position": matched_position,
+            "matched_stop_orders": matched_stop_orders_before,
+            "danger": "Position exists but no stopPlanOrderId was found. Check MEXC immediately.",
+        })
+        return {
+            "status": "blocked",
+            "reason": "No stopPlanOrderId found for existing TP/SL planned order",
+            "stop_orders_snapshot_before": stop_orders_snapshot_before,
+            "matched_stop_orders_before": matched_stop_orders_before,
+            "state_after": state_after,
+            "danger": "Manual inspection required.",
+        }
+
+    change_body = build_change_plan_price_order(
+        stop_plan_order_id=stop_plan_order_id,
+        stop=new_stop,
+        target=effective_target,
+    )
+
+    change_result = change_plan_price_only_if_armed(change_body)
+
+    time.sleep(0.5)
+
+    stop_orders_snapshot_after = get_mexc_open_stop_orders(MEXC_CONTRACT_SYMBOL, position_id=position_id)
+    matched_stop_orders_after = stop_orders_for_position(stop_orders_snapshot_after, position_id)
+    change_success = mexc_success(change_result.get("mexc_response", {}))
+
+    final_status = "OPEN_WITH_SLTP_UPDATED" if change_success else "OPEN_BUT_TRAIL_UPDATE_FAILED"
+
+    state_after = save_live_state({
+        **live_state,
+        "status": final_status,
+        "symbol": MEXC_CONTRACT_SYMBOL,
+        "side": state_side,
+        "positionId": position_id,
+        "position": matched_position,
+        "currentStop": new_stop if change_success else current_stop,
+        "currentTarget": effective_target,
+        "lastTrailUpdate": {
+            "action": base_action,
+            "oldStop": current_stop,
+            "newStop": new_stop,
+            "target": effective_target,
+            "price": validated["price"],
+            "stopPlanOrderId": stop_plan_order_id,
+            "change_body": change_body,
+            "change_success": change_success,
+            "updated_at_utc": utc_now(),
+        },
+        "matched_stop_orders": matched_stop_orders_after,
+        "danger": None if change_success else "Position is open but SL/TP modification failed. Check MEXC immediately.",
+    })
+
+    return {
+        "status": final_status,
+        "live_state_before": live_state,
+        "position": matched_position,
+        "positionId": position_id,
+        "stop_plan_order_id": stop_plan_order_id,
+        "change_body": change_body,
+        "change_result": change_result,
+        "stop_orders_snapshot_before": stop_orders_snapshot_before,
+        "matched_stop_orders_before": matched_stop_orders_before,
+        "stop_orders_snapshot_after": stop_orders_snapshot_after,
+        "matched_stop_orders_after": matched_stop_orders_after,
+        "state_saved": state_after,
+        "danger": None if change_success else "Position is open but SL/TP modification failed. Check MEXC immediately.",
     }
 
 
@@ -1056,6 +1344,7 @@ def process_paper_event(payload: dict, is_test: bool):
 # =====================================================
 
 CLEAR_LIVE_STATE_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_CLEARS_LIVE_STATE"
+TRAIL_UPDATE_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_MODIFIES_LIVE_SLTP"
 
 
 def find_open_position_by_position_id(mexc_result: dict, position_id):
@@ -1216,6 +1505,7 @@ def health_check():
         "mexc_base_url": MEXC_CONTRACT_BASE_URL,
         "mexc_order_create_path": MEXC_ORDER_CREATE_PATH,
         "mexc_stop_order_place_path": MEXC_STOP_ORDER_PLACE_PATH,
+        "mexc_stop_order_change_plan_price_path": MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH,
         "mexc_contract_size": MEXC_CONTRACT_SIZE,
         "mexc_min_contract_vol": MEXC_MIN_CONTRACT_VOL,
         "mexc_leverage": MEXC_LEVERAGE,
@@ -1449,6 +1739,84 @@ def dry_run_order(request: Request):
             "reason": f"failed to build dry-run order: {str(e)}",
             "simulated_payload": simulated_payload,
         }
+
+
+@app.get("/manual-trail-update-test")
+def manual_trail_update_test(request: Request):
+    """
+    Controlled manual test for modifying existing TP/SL planned order.
+
+    Required query params:
+    - secret
+    - side=long or short
+    - price
+    - stop
+    - target
+    - confirm=I_UNDERSTAND_THIS_MODIFIES_LIVE_SLTP
+    """
+    secret = request.query_params.get("secret")
+    side = request.query_params.get("side", "").lower()
+    confirm = request.query_params.get("confirm")
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    if confirm != TRAIL_UPDATE_CONFIRM_PHRASE:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing or incorrect confirmation phrase. Use confirm=I_UNDERSTAND_THIS_MODIFIES_LIVE_SLTP"
+        )
+
+    if not LIVE_TRADING_ENABLED:
+        return {
+            "status": "blocked",
+            "reason": "LIVE_TRADING_ENABLED=false",
+            "change_sent": False,
+        }
+
+    if AUTO_TV_EXECUTION_ENABLED:
+        return {
+            "status": "blocked",
+            "reason": "AUTO_TV_EXECUTION_ENABLED=true. For manual testing, keep it false.",
+            "change_sent": False,
+        }
+
+    if side not in {"long", "short"}:
+        raise HTTPException(status_code=400, detail="side must be long or short")
+
+    price = to_float(request.query_params.get("price"), "price")
+    stop = to_float(request.query_params.get("stop"), "stop")
+    target = to_float(request.query_params.get("target"), "target")
+
+    simulated_action = "LONG_TRAIL_UPDATE" if side == "long" else "SHORT_TRAIL_UPDATE"
+
+    payload = {
+        "symbol": EXPECTED_SYMBOL,
+        "action": simulated_action,
+        "side": side.upper(),
+        "price": price,
+        "stop": stop,
+        "target": target,
+        "qty": None,
+        "time": None,
+        "timeframe": EXPECTED_TIMEFRAME,
+    }
+
+    result = trail_update_workflow(payload)
+
+    event = {
+        "event": "manual_trail_update_test",
+        "received_at_utc": utc_now(),
+        "payload": payload,
+        "result": result,
+    }
+    print(json.dumps(event))
+
+    return {
+        "status": "ok" if str(result.get("status", "")).endswith("UPDATED") else result.get("status", "unknown"),
+        "payload": payload,
+        "trail_update_result": result,
+    }
 
 
 @app.get("/manual-live-test-entry-then-sltp")
