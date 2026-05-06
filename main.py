@@ -47,6 +47,7 @@ MEXC_PRICE_PROTECT = int(os.getenv("MEXC_PRICE_PROTECT", "0"))
 MEXC_BALANCE_CURRENCY = os.getenv("MEXC_BALANCE_CURRENCY", "USDT")
 BACKEND_RISK_PCT = float(os.getenv("BACKEND_RISK_PCT", "1.0"))
 BALANCE_SAFETY_MULTIPLIER = float(os.getenv("BALANCE_SAFETY_MULTIPLIER", "0.95"))
+USE_BACKEND_BALANCE_SIZING = os.getenv("USE_BACKEND_BALANCE_SIZING", "false").lower() == "true"
 
 MEXC_CONTRACT_SIZE = float(os.getenv("MEXC_CONTRACT_SIZE", "0.0001"))
 MEXC_MIN_CONTRACT_VOL = int(os.getenv("MEXC_MIN_CONTRACT_VOL", "1"))
@@ -469,7 +470,7 @@ def calculate_backend_position_size(price: float, stop: float, risk_pct: float =
         "final_qty_btc": final_qty_btc,
         "mexc_contract_size": MEXC_CONTRACT_SIZE,
         "mexc_vol_contracts": mexc_vol,
-        "note": "Dry-run only. Live execution still uses current entry workflow until backend sizing is explicitly enabled.",
+        "note": "Dry-run only unless USE_BACKEND_BALANCE_SIZING=true inside live entry workflow.",
     }
 
 
@@ -642,21 +643,34 @@ def validate_entry_payload(payload: dict):
         raise ValueError(f"Cannot validate non-entry action: {action}")
 
     price = to_float(payload.get("price"), "price")
-    qty = to_float(payload.get("qty"), "qty")
     stop = to_float(payload.get("stop"), "stop")
     target = to_float(payload.get("target"), "target")
+
+    qty_raw = payload.get("qty")
+    qty_is_missing = qty_raw in [None, "", "null"]
+
+    # If backend sizing is enabled, TradingView qty may be null.
+    # The execution bridge will calculate final qty from MEXC balance before order submission.
+    if qty_is_missing:
+        if USE_BACKEND_BALANCE_SIZING:
+            qty = None
+        else:
+            raise ValueError("qty is required unless USE_BACKEND_BALANCE_SIZING=true")
+    else:
+        qty = to_float(qty_raw, "qty")
 
     if price <= 0:
         raise ValueError(f"price must be > 0, got {price}")
 
-    if qty <= 0:
-        raise ValueError(f"qty must be > 0, got {qty}")
+    if qty is not None:
+        if qty <= 0:
+            raise ValueError(f"qty must be > 0, got {qty}")
 
-    if qty < MIN_ORDER_VOL:
-        raise ValueError(f"qty {qty} is below MIN_ORDER_VOL {MIN_ORDER_VOL}")
+        if qty < MIN_ORDER_VOL:
+            raise ValueError(f"qty {qty} is below MIN_ORDER_VOL {MIN_ORDER_VOL}")
 
-    if qty > MAX_ORDER_VOL:
-        raise ValueError(f"qty {qty} exceeds MAX_ORDER_VOL {MAX_ORDER_VOL}")
+        if qty > MAX_ORDER_VOL:
+            raise ValueError(f"qty {qty} exceeds MAX_ORDER_VOL {MAX_ORDER_VOL}")
 
     if stop <= 0:
         raise ValueError(f"stop must be > 0, got {stop}")
@@ -679,11 +693,11 @@ def validate_entry_payload(payload: dict):
     return {
         "price": price,
         "qty": qty,
+        "qty_was_missing": qty_is_missing,
         "stop": stop,
         "target": target,
         "base_action": base_action,
     }
-
 
 def build_mexc_entry_only_order(payload: dict):
     validated = validate_entry_payload(payload)
@@ -953,23 +967,75 @@ def mexc_success(result: dict):
 
 def entry_then_sltp_workflow(payload: dict):
     """
-    Manual-only workflow:
-    1. entry-only market order
-    2. wait
-    3. read open position
-    4. extract positionId
-    5. place position-level TP/SL
-    6. verify stop order list
-    7. save state
+    Entry workflow:
+    1. validate signal geometry
+    2. optionally calculate final qty from MEXC balance
+    3. entry-only market order
+    4. wait
+    5. read open position
+    6. extract positionId
+    7. place position-level TP/SL
+    8. verify stop order list
+    9. save state
     """
     validated = validate_entry_payload(payload)
     base_action = validated["base_action"]
-    qty_btc = validated["qty"]
     stop = validated["stop"]
     target = validated["target"]
-    mexc_vol = btc_qty_to_mexc_vol(qty_btc)
 
-    proposed_entry = build_mexc_entry_only_order(payload)
+    pine_qty = validated.get("qty")
+    sizing_result = None
+    sizing_mode = "PINE_QTY"
+
+    payload_for_order = payload.copy()
+
+    if USE_BACKEND_BALANCE_SIZING:
+        risk_pct_raw = payload.get("riskPct", payload.get("risk_pct", None))
+        risk_pct = None if risk_pct_raw in [None, "", "null"] else to_float(risk_pct_raw, "riskPct")
+
+        sizing_result = calculate_backend_position_size(
+            price=validated["price"],
+            stop=stop,
+            risk_pct=risk_pct,
+        )
+
+        if not sizing_result.get("ok"):
+            return {
+                "status": "entry_blocked_backend_sizing_failed",
+                "reason": sizing_result.get("reason", "backend sizing failed"),
+                "payload": payload,
+                "sizing_result": sizing_result,
+                "live_order_sent": False,
+            }
+
+        qty_btc = sizing_result["final_qty_btc"]
+        mexc_vol = sizing_result["mexc_vol_contracts"]
+        payload_for_order["qty"] = qty_btc
+        sizing_mode = "BACKEND_BALANCE"
+
+    else:
+        if pine_qty is None:
+            return {
+                "status": "entry_blocked_qty_missing",
+                "reason": "Pine/alert qty is missing and USE_BACKEND_BALANCE_SIZING=false",
+                "payload": payload,
+                "live_order_sent": False,
+            }
+        qty_btc = pine_qty
+        mexc_vol = btc_qty_to_mexc_vol(qty_btc)
+
+    proposed_entry = build_mexc_entry_only_order(payload_for_order)
+
+    # Make the audit trail explicit: the actual order body volume is what MEXC receives.
+    proposed_entry["sizing"] = {
+        "sizing_mode": sizing_mode,
+        "use_backend_balance_sizing": USE_BACKEND_BALANCE_SIZING,
+        "pine_qty_btc": pine_qty,
+        "final_qty_btc": qty_btc,
+        "mexc_vol_contracts": mexc_vol,
+        "backend_sizing_result": sizing_result,
+        "max_order_vol_btc": MAX_ORDER_VOL,
+    }
 
     entry_result = place_live_order_only_if_armed(proposed_entry["order_body"])
 
@@ -1000,6 +1066,9 @@ def entry_then_sltp_workflow(payload: dict):
             "side": "LONG" if base_action == "LONG_ENTRY" else "SHORT",
             "entryOrderId": entry_order_id,
             "qty_btc": qty_btc,
+            "pine_qty_btc": pine_qty,
+            "sizing_mode": sizing_mode,
+            "backend_sizing_result": sizing_result,
             "mexc_vol": mexc_vol,
             "stop": stop,
             "target": target,
@@ -1025,6 +1094,9 @@ def entry_then_sltp_workflow(payload: dict):
             "side": "LONG" if base_action == "LONG_ENTRY" else "SHORT",
             "entryOrderId": entry_order_id,
             "qty_btc": qty_btc,
+            "pine_qty_btc": pine_qty,
+            "sizing_mode": sizing_mode,
+            "backend_sizing_result": sizing_result,
             "mexc_vol": mexc_vol,
             "stop": stop,
             "target": target,
@@ -1068,6 +1140,9 @@ def entry_then_sltp_workflow(payload: dict):
         "positionId": position_id,
         "entryOrderId": entry_order_id,
         "qty_btc": qty_btc,
+        "pine_qty_btc": pine_qty,
+        "sizing_mode": sizing_mode,
+        "backend_sizing_result": sizing_result,
         "mexc_vol": mexc_vol,
         "entry_reference_price": validated["price"],
         "currentStop": stop,
@@ -1081,6 +1156,10 @@ def entry_then_sltp_workflow(payload: dict):
 
     return {
         "status": final_status,
+        "sizing_mode": sizing_mode,
+        "pine_qty_btc": pine_qty,
+        "final_qty_btc": qty_btc,
+        "backend_sizing_result": sizing_result,
         "entry_result": entry_result,
         "position_snapshot": position_snapshot,
         "position": position,
@@ -1092,7 +1171,6 @@ def entry_then_sltp_workflow(payload: dict):
         "state_saved": state,
         "danger": None if sltp_success else "Position is open but SL/TP placement failed. Check MEXC immediately.",
     }
-
 
 def trail_update_workflow(payload: dict):
     """
@@ -1887,6 +1965,7 @@ def health_check():
         "mexc_balance_currency": MEXC_BALANCE_CURRENCY,
         "backend_risk_pct": BACKEND_RISK_PCT,
         "balance_safety_multiplier": BALANCE_SAFETY_MULTIPLIER,
+        "use_backend_balance_sizing": USE_BACKEND_BALANCE_SIZING,
         "backend_sizing_dry_run_available": True,
         "min_order_vol_btc": MIN_ORDER_VOL,
         "max_order_vol_btc": MAX_ORDER_VOL,
