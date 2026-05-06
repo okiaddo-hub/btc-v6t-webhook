@@ -1998,6 +1998,15 @@ def manual_entry_only_test(request: Request):
 
 @app.post("/tv-webhook")
 async def tradingview_webhook(request: Request):
+    """
+    TradingView webhook receiver.
+
+    Current live-capable behavior:
+    - LONG_ENTRY / SHORT_ENTRY can use entry_then_sltp_workflow only when both switches are true.
+    - LONG_TRAIL_UPDATE / SHORT_TRAIL_UPDATE can use trail_update_workflow only when both switches are true.
+    - TEST_ actions are always non-live.
+    - EXIT actions are accepted but live execution is not implemented yet.
+    """
     secret = request.query_params.get("secret")
 
     if secret != WEBHOOK_SECRET:
@@ -2049,26 +2058,113 @@ async def tradingview_webhook(request: Request):
     if accepted:
         base_action = clean_action(action)
 
+        # -----------------------------
+        # Entry signals
+        # -----------------------------
         if base_action in {"LONG_ENTRY", "SHORT_ENTRY"}:
             mexc_position_snapshot = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
-            entry_guard = run_entry_guard(payload, is_test=is_test, mexc_position_snapshot=mexc_position_snapshot)
+            entry_guard = run_entry_guard(
+                payload,
+                is_test=is_test,
+                mexc_position_snapshot=mexc_position_snapshot,
+            )
 
-            if entry_guard["guard_passed"] and entry_guard["would_enter"]:
+            if is_test:
+                workflow_result = {
+                    "live_order_sent": False,
+                    "reason": "TEST entry event received; live execution intentionally blocked.",
+                    "live_trading_enabled": LIVE_TRADING_ENABLED,
+                    "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
+                }
+
+            elif entry_guard["guard_passed"] and entry_guard["would_enter"]:
                 if LIVE_TRADING_ENABLED and AUTO_TV_EXECUTION_ENABLED:
                     workflow_result = entry_then_sltp_workflow(payload)
                 else:
                     try:
                         proposed_entry = build_mexc_entry_only_order(payload)
+                        proposed_sltp_example = build_position_sltp_order(
+                            position_id=123456789,
+                            mexc_vol=proposed_entry["conversion"]["mexc_vol_contracts"],
+                            stop=to_float(payload.get("stop"), "stop"),
+                            target=to_float(payload.get("target"), "target"),
+                        )
                         workflow_result = {
                             "live_order_sent": False,
                             "reason": "TradingView auto execution disabled. No live order submitted.",
                             "live_trading_enabled": LIVE_TRADING_ENABLED,
                             "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
                             "would_send_entry_order": proposed_entry["order_body"],
-                            "next_step_if_auto_enabled": "entry-only -> read positionId -> stoporder/place",
+                            "would_send_sltp_order_example": {
+                                "note": "positionId is fake here; real positionId is read after entry opens",
+                                "body": proposed_sltp_example,
+                            },
+                            "next_step_if_auto_enabled": "entry-only -> read positionId -> stoporder/place -> verify",
                         }
                     except Exception as e:
-                        workflow_result = {"live_order_sent": False, "reason": f"failed to build proposed order: {str(e)}"}
+                        workflow_result = {
+                            "live_order_sent": False,
+                            "reason": f"failed to build proposed entry workflow: {str(e)}",
+                        }
+
+            else:
+                workflow_result = {
+                    "live_order_sent": False,
+                    "reason": "entry guard did not pass; no live order submitted",
+                    "entry_guard": entry_guard,
+                }
+
+        # -----------------------------
+        # Trail-update signals
+        # -----------------------------
+        elif base_action in {"LONG_TRAIL_UPDATE", "SHORT_TRAIL_UPDATE"}:
+            if is_test:
+                workflow_result = {
+                    "change_sent": False,
+                    "reason": "TEST trail update received; live SL/TP modification intentionally blocked.",
+                    "live_trading_enabled": LIVE_TRADING_ENABLED,
+                    "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
+                    "live_state": load_live_state(),
+                }
+
+            elif LIVE_TRADING_ENABLED and AUTO_TV_EXECUTION_ENABLED:
+                workflow_result = trail_update_workflow(payload)
+
+            else:
+                try:
+                    validated = validate_trail_update_payload(payload)
+                    workflow_result = {
+                        "change_sent": False,
+                        "reason": "TradingView auto execution disabled. No live SL/TP modification submitted.",
+                        "live_trading_enabled": LIVE_TRADING_ENABLED,
+                        "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
+                        "would_modify": {
+                            "action": validated["base_action"],
+                            "price": validated["price"],
+                            "stop": validated["stop"],
+                            "target": validated["target"],
+                            "path": MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH,
+                        },
+                        "live_state": load_live_state(),
+                    }
+                except Exception as e:
+                    workflow_result = {
+                        "change_sent": False,
+                        "reason": f"failed to validate proposed trail update: {str(e)}",
+                    }
+
+        # -----------------------------
+        # Exit signals - accepted, but not live-wired yet
+        # -----------------------------
+        elif base_action in {"LONG_EXIT", "SHORT_EXIT"}:
+            workflow_result = {
+                "live_order_sent": False,
+                "reason": "Exit webhook accepted, but live exit/reconciliation execution is not implemented yet.",
+                "live_trading_enabled": LIVE_TRADING_ENABLED,
+                "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
+                "next_development_step": "Implement close/reconcile/cancel-leftover-SLTP workflow before enabling exits.",
+                "live_state": load_live_state(),
+            }
 
         paper_result = process_paper_event(payload, is_test)
 
