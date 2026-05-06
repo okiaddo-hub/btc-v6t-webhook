@@ -1150,7 +1150,13 @@ def build_mexc_close_order_from_position(position: dict, state_side: str):
     Builds a market close order for the current MEXC position.
 
     Uses the actual MEXC holdVol, not the TradingView alert qty.
-    In one-way mode, reduceOnly=true is included as an additional safety flag.
+
+    Proven close format from manual close-variant testing on BTC_USDT short:
+    - include: symbol, price=0, vol, side, type=5, externalOid, leverage, openType
+    - omit: positionId, reduceOnly, positionMode
+
+    The previous close body included positionId + reduceOnly + positionMode and MEXC
+    rejected it with code 2001: "Order direction error".
     """
     position_id = extract_position_id(position)
     hold_vol = extract_hold_vol(position)
@@ -1171,14 +1177,11 @@ def build_mexc_close_order_from_position(position: dict, state_side: str):
         "symbol": MEXC_CONTRACT_SYMBOL,
         "price": 0,
         "vol": close_vol,
-        "leverage": MEXC_LEVERAGE,
         "side": close_side_for_state_side(state_side),
         "type": MEXC_ORDER_TYPE,
-        "openType": MEXC_OPEN_TYPE,
         "externalOid": short_external_oid(),
-        "positionMode": MEXC_POSITION_MODE,
-        "positionId": int(position_id),
-        "reduceOnly": True,
+        "leverage": MEXC_LEVERAGE,
+        "openType": MEXC_OPEN_TYPE,
     }
 
     return body
@@ -1716,6 +1719,8 @@ def health_check():
         "mexc_stop_order_place_path": MEXC_STOP_ORDER_PLACE_PATH,
         "mexc_stop_order_change_plan_price_path": MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH,
         "exit_confirm_phrase_required": "I_UNDERSTAND_THIS_CLOSES_LIVE_POSITION",
+        "manual_close_variant_test_available": True,
+        "tv_exit_close_format": "omit positionId, reduceOnly, and positionMode; keep side, leverage, openType",
         "mexc_contract_size": MEXC_CONTRACT_SIZE,
         "mexc_min_contract_vol": MEXC_MIN_CONTRACT_VOL,
         "mexc_leverage": MEXC_LEVERAGE,
@@ -2503,7 +2508,7 @@ async def tradingview_webhook(request: Request):
     - LONG_ENTRY / SHORT_ENTRY can use entry_then_sltp_workflow only when both switches are true.
     - LONG_TRAIL_UPDATE / SHORT_TRAIL_UPDATE can use trail_update_workflow only when both switches are true.
     - TEST_ actions are always non-live.
-    - EXIT actions are accepted but live execution is not implemented yet.
+    - LONG_EXIT / SHORT_EXIT can close the live MEXC position only when both switches are true.
     """
     secret = request.query_params.get("secret")
 
