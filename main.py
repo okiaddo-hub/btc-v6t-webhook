@@ -2098,6 +2098,225 @@ def manual_exit_test(request: Request):
     }
 
 
+
+@app.get("/manual-close-variant-test")
+def manual_close_variant_test(request: Request):
+    """
+    Controlled one-off live close-order variant test.
+
+    Purpose:
+    - Test MEXC close-order body variants after order/create returned code 2001.
+    - Uses actual MEXC holdVol from the saved live position.
+    - Clears live state only if MEXC confirms the position is flat after the attempt.
+
+    Required query params:
+    - secret
+    - side=long or short
+    - close_side=1|2|3|4
+    - confirm=I_UNDERSTAND_THIS_CLOSES_LIVE_POSITION
+
+    Optional booleans, defaults shown:
+    - include_position_id=false
+    - include_reduce_only=false
+    - include_position_mode=false
+    - include_open_type=true
+    - include_leverage=true
+    """
+    secret = request.query_params.get("secret")
+    side = request.query_params.get("side", "").lower()
+    confirm = request.query_params.get("confirm")
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    if confirm != EXIT_CONFIRM_PHRASE:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing or incorrect confirmation phrase. Use confirm=I_UNDERSTAND_THIS_CLOSES_LIVE_POSITION"
+        )
+
+    if side not in {"long", "short"}:
+        raise HTTPException(status_code=400, detail="side must be long or short")
+
+    if not LIVE_TRADING_ENABLED:
+        return {
+            "status": "blocked",
+            "reason": "LIVE_TRADING_ENABLED=false",
+            "close_order_sent": False,
+        }
+
+    def bool_param(name: str, default: bool):
+        raw = request.query_params.get(name)
+        if raw is None:
+            return default
+        return str(raw).lower() in {"1", "true", "yes", "y"}
+
+    close_side_raw = request.query_params.get("close_side")
+    if close_side_raw is None:
+        raise HTTPException(status_code=400, detail="close_side is required: use 1, 2, 3, or 4")
+
+    try:
+        close_side = int(close_side_raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="close_side must be integer 1, 2, 3, or 4")
+
+    if close_side not in {1, 2, 3, 4}:
+        raise HTTPException(status_code=400, detail="close_side must be 1, 2, 3, or 4")
+
+    include_position_id = bool_param("include_position_id", False)
+    include_reduce_only = bool_param("include_reduce_only", False)
+    include_position_mode = bool_param("include_position_mode", False)
+    include_open_type = bool_param("include_open_type", True)
+    include_leverage = bool_param("include_leverage", True)
+
+    live_state = load_live_state()
+
+    if live_state.get("status") in ["EMPTY", None]:
+        return {
+            "status": "blocked",
+            "reason": "Local live state is empty. Open a tiny test position first.",
+            "live_state": live_state,
+        }
+
+    expected_state_side = "LONG" if side == "long" else "SHORT"
+    state_side = live_state.get("side")
+
+    if state_side != expected_state_side:
+        return {
+            "status": "blocked",
+            "reason": f"requested side {expected_state_side} does not match live state side {state_side}",
+            "live_state": live_state,
+        }
+
+    position_id = live_state.get("positionId")
+    position_snapshot_before = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+    matched_position = None
+
+    if position_id not in [None, "", 0, "0"]:
+        matched_position = find_open_position_by_position_id(position_snapshot_before, position_id)
+
+    if matched_position is None:
+        state_after = clear_live_state("manual close variant: saved position already closed on MEXC")
+        return {
+            "status": "ALREADY_CLOSED_ON_MEXC",
+            "reason": "Saved positionId not found in open positions; local state cleared.",
+            "position_snapshot_before": position_snapshot_before,
+            "state_after": state_after,
+        }
+
+    actual_position_id = extract_position_id(matched_position)
+    hold_vol = extract_hold_vol(matched_position)
+
+    if hold_vol is None or hold_vol <= 0:
+        return {
+            "status": "blocked",
+            "reason": f"Invalid MEXC holdVol: {hold_vol}",
+            "matched_position": matched_position,
+        }
+
+    close_vol = int(round(float(hold_vol)))
+
+    close_body = {
+        "symbol": MEXC_CONTRACT_SYMBOL,
+        "price": 0,
+        "vol": close_vol,
+        "side": close_side,
+        "type": MEXC_ORDER_TYPE,
+        "externalOid": short_external_oid(),
+    }
+
+    if include_leverage:
+        close_body["leverage"] = MEXC_LEVERAGE
+    if include_open_type:
+        close_body["openType"] = MEXC_OPEN_TYPE
+    if include_position_mode:
+        close_body["positionMode"] = MEXC_POSITION_MODE
+    if include_position_id:
+        close_body["positionId"] = int(actual_position_id)
+    if include_reduce_only:
+        close_body["reduceOnly"] = True
+
+    close_result = close_position_only_if_armed(close_body)
+    close_success = mexc_success(close_result.get("mexc_response", {}))
+
+    time.sleep(1.0)
+
+    position_snapshot_after = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+    matched_position_after = find_open_position_by_position_id(position_snapshot_after, actual_position_id)
+    stop_orders_snapshot_after = get_mexc_open_stop_orders(MEXC_CONTRACT_SYMBOL, position_id=actual_position_id)
+
+    if close_success and matched_position_after is None:
+        state_after = clear_live_state("manual close variant succeeded and MEXC is flat")
+        status = "CLOSED_AND_STATE_CLEARED"
+        danger = None
+    else:
+        state_after = save_live_state({
+            **live_state,
+            "status": "CLOSE_VARIANT_SUBMITTED_BUT_POSITION_STILL_OPEN" if close_success else "CLOSE_VARIANT_FAILED",
+            "lastCloseVariantAttempt": {
+                "close_side": close_side,
+                "include_position_id": include_position_id,
+                "include_reduce_only": include_reduce_only,
+                "include_position_mode": include_position_mode,
+                "include_open_type": include_open_type,
+                "include_leverage": include_leverage,
+                "close_body": close_body,
+                "close_success": close_success,
+                "updated_at_utc": utc_now(),
+            },
+            "position_snapshot_after": position_snapshot_after,
+            "stop_orders_snapshot_after": stop_orders_snapshot_after,
+            "danger": "Close variant failed or position still open. Check MEXC immediately.",
+        })
+        status = state_after.get("status")
+        danger = "Close variant failed or position still open. Check MEXC immediately."
+
+    event = {
+        "event": "manual_close_variant_test",
+        "received_at_utc": utc_now(),
+        "requested_side": side,
+        "variant": {
+            "close_side": close_side,
+            "include_position_id": include_position_id,
+            "include_reduce_only": include_reduce_only,
+            "include_position_mode": include_position_mode,
+            "include_open_type": include_open_type,
+            "include_leverage": include_leverage,
+        },
+        "close_body": close_body,
+        "close_result": close_result,
+        "position_snapshot_after": position_snapshot_after,
+        "matched_position_after": matched_position_after,
+        "state_after": state_after,
+        "danger": danger,
+    }
+    print(json.dumps(event))
+
+    return {
+        "status": status,
+        "requested_side": side,
+        "variant": {
+            "close_side": close_side,
+            "include_position_id": include_position_id,
+            "include_reduce_only": include_reduce_only,
+            "include_position_mode": include_position_mode,
+            "include_open_type": include_open_type,
+            "include_leverage": include_leverage,
+        },
+        "live_state_before": live_state,
+        "position_before": matched_position,
+        "positionId": actual_position_id,
+        "close_body": close_body,
+        "close_result": close_result,
+        "position_snapshot_before": position_snapshot_before,
+        "position_snapshot_after": position_snapshot_after,
+        "matched_position_after": matched_position_after,
+        "stop_orders_snapshot_after": stop_orders_snapshot_after,
+        "state_after": state_after,
+        "danger": danger,
+    }
+
+
 @app.get("/manual-live-test-entry-then-sltp")
 def manual_live_test_entry_then_sltp(request: Request):
     """
