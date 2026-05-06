@@ -1052,6 +1052,155 @@ def process_paper_event(payload: dict, is_test: bool):
 
 
 # =====================================================
+# Live state reconciliation helpers
+# =====================================================
+
+CLEAR_LIVE_STATE_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_CLEARS_LIVE_STATE"
+
+
+def find_open_position_by_position_id(mexc_result: dict, position_id):
+    position_id_str = str(position_id)
+    for pos in extract_positions(mexc_result):
+        if not isinstance(pos, dict):
+            continue
+        if pos.get("symbol") != MEXC_CONTRACT_SYMBOL:
+            continue
+        if not position_is_open(pos):
+            continue
+        if str(extract_position_id(pos)) == position_id_str:
+            return pos
+    return None
+
+
+def get_open_positions_for_symbol(mexc_result: dict, symbol: str):
+    matched = []
+    for pos in extract_positions(mexc_result):
+        if not isinstance(pos, dict):
+            continue
+        if pos.get("symbol") != symbol:
+            continue
+        if position_is_open(pos):
+            matched.append(pos)
+    return matched
+
+
+def reconcile_live_state_workflow(clear_if_flat: bool = True):
+    """
+    Reconcile local live_trade_state.json with MEXC.
+
+    If local state says a trade is open but MEXC is flat, clear local state by default.
+    If MEXC still has the position open, refresh position and stop-order information.
+    """
+    previous_state = load_live_state()
+    position_snapshot = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+    open_positions = get_open_positions_for_symbol(position_snapshot, MEXC_CONTRACT_SYMBOL)
+
+    state_status = previous_state.get("status")
+    saved_position_id = previous_state.get("positionId")
+
+    if state_status == "EMPTY" and not open_positions:
+        return {
+            "status": "ok",
+            "reconciliation": "already_empty_and_mexc_flat",
+            "previous_state": previous_state,
+            "position_snapshot": position_snapshot,
+            "open_positions": open_positions,
+            "state_after": previous_state,
+        }
+
+    if not position_snapshot.get("ok"):
+        return {
+            "status": "error",
+            "reconciliation": "could_not_read_mexc_positions",
+            "previous_state": previous_state,
+            "position_snapshot": position_snapshot,
+            "danger": "Could not verify whether MEXC has an open position.",
+        }
+
+    if not open_positions:
+        stop_orders_snapshot = get_mexc_open_stop_orders(MEXC_CONTRACT_SYMBOL, position_id=saved_position_id)
+
+        if clear_if_flat:
+            state_after = clear_live_state("reconciled: MEXC is flat; local state cleared")
+            reconciliation = "mexc_flat_local_state_cleared"
+        else:
+            state_after = save_live_state({
+                "status": "CLOSED_OR_FLAT_ON_MEXC",
+                "reason": "reconciled: MEXC has no open position for symbol",
+                "previous_state": previous_state,
+                "position_snapshot": position_snapshot,
+                "stop_orders_snapshot": stop_orders_snapshot,
+            })
+            reconciliation = "mexc_flat_local_state_marked_closed"
+
+        return {
+            "status": "ok",
+            "reconciliation": reconciliation,
+            "previous_state": previous_state,
+            "position_snapshot": position_snapshot,
+            "stop_orders_snapshot": stop_orders_snapshot,
+            "state_after": state_after,
+        }
+
+    # MEXC has at least one open position.
+    matched_position = None
+
+    if saved_position_id not in [None, "", 0, "0"]:
+        matched_position = find_open_position_by_position_id(position_snapshot, saved_position_id)
+
+    if matched_position is None and len(open_positions) == 1:
+        matched_position = open_positions[0]
+
+    if matched_position is None:
+        state_after = save_live_state({
+            "status": "RECONCILE_AMBIGUOUS_OPEN_POSITIONS",
+            "reason": "MEXC has multiple open positions or saved positionId does not match; manual inspection required",
+            "previous_state": previous_state,
+            "position_snapshot": position_snapshot,
+            "open_positions": open_positions,
+            "danger": "Do not open another trade until this is resolved.",
+        })
+        return {
+            "status": "warning",
+            "reconciliation": "ambiguous_open_positions",
+            "previous_state": previous_state,
+            "open_positions": open_positions,
+            "state_after": state_after,
+            "danger": "Manual inspection required.",
+        }
+
+    position_id = extract_position_id(matched_position)
+    stop_orders_snapshot = get_mexc_open_stop_orders(MEXC_CONTRACT_SYMBOL, position_id=position_id)
+    matched_stop_orders = stop_orders_for_position(stop_orders_snapshot, position_id)
+
+    refreshed_status = "OPEN_WITH_SLTP_PLACED" if matched_stop_orders else "OPEN_BUT_NO_STOP_ORDERS_FOUND"
+
+    state_after = previous_state.copy() if isinstance(previous_state, dict) else {}
+    state_after.update({
+        "status": refreshed_status,
+        "symbol": MEXC_CONTRACT_SYMBOL,
+        "positionId": position_id,
+        "position": matched_position,
+        "matched_stop_orders": matched_stop_orders,
+        "reconciled_at_utc": utc_now(),
+        "danger": None if matched_stop_orders else "MEXC position is open but no matching SL/TP stop orders were found.",
+    })
+    state_after = save_live_state(state_after)
+
+    return {
+        "status": "ok" if matched_stop_orders else "warning",
+        "reconciliation": "mexc_position_open_state_refreshed",
+        "previous_state": previous_state,
+        "position": matched_position,
+        "positionId": position_id,
+        "stop_orders_snapshot": stop_orders_snapshot,
+        "matched_stop_orders": matched_stop_orders,
+        "state_after": state_after,
+        "danger": None if matched_stop_orders else "MEXC position is open but no matching SL/TP stop orders were found.",
+    }
+
+
+# =====================================================
 # Routes
 # =====================================================
 
@@ -1093,6 +1242,74 @@ def get_state():
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
     }
+
+
+
+
+@app.get("/live-state")
+def live_state(request: Request):
+    secret = request.query_params.get("secret")
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    return {
+        "status": "ok",
+        "live_state": load_live_state(),
+        "state_file_path": STATE_FILE_PATH,
+    }
+
+
+@app.post("/clear-live-state")
+def clear_live_state_route(request: Request):
+    secret = request.query_params.get("secret")
+    confirm = request.query_params.get("confirm")
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    if confirm != CLEAR_LIVE_STATE_CONFIRM_PHRASE:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing or incorrect confirmation phrase. Use confirm=I_UNDERSTAND_THIS_CLEARS_LIVE_STATE"
+        )
+
+    state_after = clear_live_state("manual clear-live-state endpoint")
+
+    event = {
+        "event": "clear_live_state",
+        "received_at_utc": utc_now(),
+        "state_after": state_after,
+    }
+    print(json.dumps(event))
+
+    return {
+        "status": "ok",
+        "message": "live state cleared",
+        "state_after": state_after,
+    }
+
+
+@app.post("/reconcile-live-state")
+def reconcile_live_state_route(request: Request):
+    secret = request.query_params.get("secret")
+    clear_if_flat_raw = request.query_params.get("clear_if_flat", "true").lower()
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    clear_if_flat = clear_if_flat_raw in ["1", "true", "yes", "y"]
+    result = reconcile_live_state_workflow(clear_if_flat=clear_if_flat)
+
+    event = {
+        "event": "reconcile_live_state",
+        "received_at_utc": utc_now(),
+        "clear_if_flat": clear_if_flat,
+        "result": result,
+    }
+    print(json.dumps(event))
+
+    return result
 
 
 @app.post("/reset-state")
