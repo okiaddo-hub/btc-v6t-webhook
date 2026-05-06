@@ -49,6 +49,15 @@ BACKEND_RISK_PCT = float(os.getenv("BACKEND_RISK_PCT", "1.0"))
 BALANCE_SAFETY_MULTIPLIER = float(os.getenv("BALANCE_SAFETY_MULTIPLIER", "0.95"))
 USE_BACKEND_BALANCE_SIZING = os.getenv("USE_BACKEND_BALANCE_SIZING", "false").lower() == "true"
 
+# Backend sizing guardrails.
+# Dynamic cap scales with the intended risk-based size.
+# Notional cap scales with account balance and leverage-style exposure.
+# Alert risk is ignored by default; BACKEND_RISK_PCT in .env is the authority.
+DYNAMIC_SIZE_CAP_MULTIPLIER = float(os.getenv("DYNAMIC_SIZE_CAP_MULTIPLIER", "1.20"))
+MAX_NOTIONAL_MULTIPLE_OF_BALANCE = float(os.getenv("MAX_NOTIONAL_MULTIPLE_OF_BALANCE", str(MEXC_LEVERAGE)))
+MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.30"))
+ALLOW_ALERT_RISK_PCT = os.getenv("ALLOW_ALERT_RISK_PCT", "false").lower() == "true"
+
 MEXC_CONTRACT_SIZE = float(os.getenv("MEXC_CONTRACT_SIZE", "0.0001"))
 MEXC_MIN_CONTRACT_VOL = int(os.getenv("MEXC_MIN_CONTRACT_VOL", "1"))
 
@@ -379,16 +388,43 @@ def choose_balance_for_sizing(asset: dict):
     return None, None
 
 
+def resolve_backend_risk_pct(payload: dict = None, risk_pct=None):
+    """
+    Risk % source of truth.
+
+    Default: BACKEND_RISK_PCT from .env.
+    Optional override: request/dry-run risk_pct parameter.
+    Optional alert override: only if ALLOW_ALERT_RISK_PCT=true.
+    """
+    if risk_pct not in [None, "", "null"]:
+        return float(risk_pct), "request_parameter"
+
+    if payload and ALLOW_ALERT_RISK_PCT:
+        raw = payload.get("riskPct", payload.get("risk_pct", None))
+        if raw not in [None, "", "null"]:
+            return float(raw), "alert_payload"
+
+    return BACKEND_RISK_PCT, "backend_env"
+
+
 def calculate_backend_position_size(price: float, stop: float, risk_pct: float = None):
     """
-    Dry-run backend sizing only. No order is placed here.
+    Backend sizing calculation. No order is placed here.
 
     Formula:
+    effective_balance = MEXC usable balance * BALANCE_SAFETY_MULTIPLIER
     risk_amount_usdt = effective_balance * risk_pct
     stop_distance_usdt = abs(price - stop)
     qty_btc_by_risk = risk_amount_usdt / stop_distance_usdt
-    max_qty_by_leverage = effective_balance * leverage / price
-    final qty is capped by risk, leverage, and MAX_ORDER_VOL.
+
+    Guardrails:
+    - MIN_STOP_DISTANCE_PCT rejects tiny stop distances that would explode position size.
+    - max_qty_by_leverage respects configured MEXC_LEVERAGE.
+    - dynamic_cap_qty_btc = qty_btc_by_risk * DYNAMIC_SIZE_CAP_MULTIPLIER.
+    - notional_cap_qty_btc = effective_balance * MAX_NOTIONAL_MULTIPLE_OF_BALANCE / price.
+
+    In normal operation, qty_btc_by_risk should be the final limiter.
+    The other caps are safety rails that scale with account balance.
     """
     price = float(price)
     stop = float(stop)
@@ -404,7 +440,20 @@ def calculate_backend_position_size(price: float, stop: float, risk_pct: float =
     if stop_distance <= 0:
         raise ValueError("stop distance must be > 0")
 
-    risk_pct = BACKEND_RISK_PCT if risk_pct is None else float(risk_pct)
+    stop_distance_pct = (stop_distance / price) * 100.0
+
+    if MIN_STOP_DISTANCE_PCT > 0 and stop_distance_pct < MIN_STOP_DISTANCE_PCT:
+        return {
+            "ok": False,
+            "reason": f"stop distance {stop_distance_pct:.4f}% is below MIN_STOP_DISTANCE_PCT {MIN_STOP_DISTANCE_PCT}%",
+            "price": price,
+            "stop": stop,
+            "stop_distance": stop_distance,
+            "stop_distance_pct": stop_distance_pct,
+            "min_stop_distance_pct": MIN_STOP_DISTANCE_PCT,
+        }
+
+    effective_risk_pct, risk_pct_source = resolve_backend_risk_pct(risk_pct=risk_pct)
 
     asset_result = get_mexc_single_asset(MEXC_BALANCE_CURRENCY)
     asset, asset_error = extract_asset_record(asset_result, MEXC_BALANCE_CURRENCY)
@@ -426,13 +475,30 @@ def calculate_backend_position_size(price: float, stop: float, risk_pct: float =
         }
 
     effective_balance = raw_balance * BALANCE_SAFETY_MULTIPLIER
-    risk_amount = effective_balance * (risk_pct / 100.0)
+    risk_amount = effective_balance * (effective_risk_pct / 100.0)
 
     qty_btc_by_risk = risk_amount / stop_distance
     max_qty_by_leverage = (effective_balance * MEXC_LEVERAGE) / price
+    dynamic_cap_qty_btc = qty_btc_by_risk * DYNAMIC_SIZE_CAP_MULTIPLIER
+    notional_cap_qty_btc = (effective_balance * MAX_NOTIONAL_MULTIPLE_OF_BALANCE) / price
 
-    uncapped_qty_btc = min(qty_btc_by_risk, max_qty_by_leverage)
-    capped_qty_btc = min(uncapped_qty_btc, MAX_ORDER_VOL)
+    final_uncorrected_qty_btc = min(
+        qty_btc_by_risk,
+        max_qty_by_leverage,
+        dynamic_cap_qty_btc,
+        notional_cap_qty_btc,
+    )
+
+    limiting_factors = []
+    tol = 1e-12
+    if abs(final_uncorrected_qty_btc - qty_btc_by_risk) <= tol:
+        limiting_factors.append("risk_based_qty")
+    if abs(final_uncorrected_qty_btc - max_qty_by_leverage) <= tol:
+        limiting_factors.append("leverage_cap")
+    if abs(final_uncorrected_qty_btc - dynamic_cap_qty_btc) <= tol:
+        limiting_factors.append("dynamic_size_cap")
+    if abs(final_uncorrected_qty_btc - notional_cap_qty_btc) <= tol:
+        limiting_factors.append("notional_multiple_cap")
 
     result_common = {
         "asset": asset,
@@ -441,28 +507,46 @@ def calculate_backend_position_size(price: float, stop: float, risk_pct: float =
         "raw_balance": raw_balance,
         "balance_safety_multiplier": BALANCE_SAFETY_MULTIPLIER,
         "effective_balance": effective_balance,
-        "risk_pct": risk_pct,
+        "risk_pct": effective_risk_pct,
+        "risk_pct_source": risk_pct_source,
+        "allow_alert_risk_pct": ALLOW_ALERT_RISK_PCT,
         "risk_amount": risk_amount,
         "price": price,
         "stop": stop,
         "stop_distance": stop_distance,
+        "stop_distance_pct": stop_distance_pct,
+        "min_stop_distance_pct": MIN_STOP_DISTANCE_PCT,
         "qty_btc_by_risk": qty_btc_by_risk,
         "max_qty_by_leverage": max_qty_by_leverage,
-        "uncapped_qty_btc": uncapped_qty_btc,
-        "capped_qty_btc": capped_qty_btc,
-        "max_order_vol_btc": MAX_ORDER_VOL,
+        "dynamic_size_cap_multiplier": DYNAMIC_SIZE_CAP_MULTIPLIER,
+        "dynamic_cap_qty_btc": dynamic_cap_qty_btc,
+        "max_notional_multiple_of_balance": MAX_NOTIONAL_MULTIPLE_OF_BALANCE,
+        "notional_cap_qty_btc": notional_cap_qty_btc,
+        "final_uncorrected_qty_btc": final_uncorrected_qty_btc,
+        "limiting_factors": limiting_factors,
+        "legacy_max_order_vol_btc": MAX_ORDER_VOL,
         "min_order_vol_btc": MIN_ORDER_VOL,
     }
 
-    if capped_qty_btc < MIN_ORDER_VOL:
+    if final_uncorrected_qty_btc < MIN_ORDER_VOL:
         return {
             "ok": False,
-            "reason": f"Calculated qty {capped_qty_btc} is below MIN_ORDER_VOL {MIN_ORDER_VOL}",
+            "reason": f"Calculated qty {final_uncorrected_qty_btc} is below MIN_ORDER_VOL {MIN_ORDER_VOL}",
             **result_common,
         }
 
-    mexc_vol = btc_qty_to_mexc_vol(capped_qty_btc)
+    mexc_vol = btc_qty_to_mexc_vol(final_uncorrected_qty_btc)
     final_qty_btc = mexc_vol * MEXC_CONTRACT_SIZE
+
+    if final_qty_btc > dynamic_cap_qty_btc * 1.000001:
+        return {
+            "ok": False,
+            "reason": "Final rounded quantity exceeds dynamic risk cap after contract conversion",
+            **result_common,
+            "final_qty_btc": final_qty_btc,
+            "mexc_contract_size": MEXC_CONTRACT_SIZE,
+            "mexc_vol_contracts": mexc_vol,
+        }
 
     return {
         "ok": True,
@@ -470,7 +554,7 @@ def calculate_backend_position_size(price: float, stop: float, risk_pct: float =
         "final_qty_btc": final_qty_btc,
         "mexc_contract_size": MEXC_CONTRACT_SIZE,
         "mexc_vol_contracts": mexc_vol,
-        "note": "Dry-run only unless USE_BACKEND_BALANCE_SIZING=true inside live entry workflow.",
+        "note": "Backend balance sizing uses dynamic risk-aware caps that scale with balance, risk %, stop distance, price, and leverage.",
     }
 
 
@@ -710,8 +794,9 @@ def build_mexc_entry_only_order(payload: dict):
     # If TradingView sends qty:null and backend sizing is enabled, calculate the
     # final BTC qty here instead of failing inside btc_qty_to_mexc_vol().
     if qty_btc is None and USE_BACKEND_BALANCE_SIZING:
-        risk_pct_raw = payload.get("riskPct", payload.get("risk_pct", None))
-        risk_pct = None if risk_pct_raw in [None, "", "null"] else to_float(risk_pct_raw, "riskPct")
+        # Risk % is backend-controlled by default.
+        # Alert riskPct is only used if ALLOW_ALERT_RISK_PCT=true.
+        risk_pct, _risk_source = resolve_backend_risk_pct(payload=payload)
 
         sizing_result = calculate_backend_position_size(
             price=validated["price"],
@@ -757,7 +842,7 @@ def build_mexc_entry_only_order(payload: dict):
             "pine_qty_btc": validated.get("qty"),
             "final_qty_btc": qty_btc,
             "backend_sizing_result": sizing_result,
-            "max_order_vol_btc": MAX_ORDER_VOL,
+            "legacy_max_order_vol_btc": MAX_ORDER_VOL,
         },
         "validation": {
             "passed": True,
@@ -1999,9 +2084,13 @@ def health_check():
         "backend_risk_pct": BACKEND_RISK_PCT,
         "balance_safety_multiplier": BALANCE_SAFETY_MULTIPLIER,
         "use_backend_balance_sizing": USE_BACKEND_BALANCE_SIZING,
+        "dynamic_size_cap_multiplier": DYNAMIC_SIZE_CAP_MULTIPLIER,
+        "max_notional_multiple_of_balance": MAX_NOTIONAL_MULTIPLE_OF_BALANCE,
+        "min_stop_distance_pct": MIN_STOP_DISTANCE_PCT,
+        "allow_alert_risk_pct": ALLOW_ALERT_RISK_PCT,
         "backend_sizing_dry_run_available": True,
         "min_order_vol_btc": MIN_ORDER_VOL,
-        "max_order_vol_btc": MAX_ORDER_VOL,
+        "legacy_max_order_vol_btc": MAX_ORDER_VOL,
         "max_manual_test_vol_btc": MAX_MANUAL_TEST_VOL,
         "entry_settle_wait_seconds": ENTRY_SETTLE_WAIT_SECONDS,
         "state_file_path": STATE_FILE_PATH,
