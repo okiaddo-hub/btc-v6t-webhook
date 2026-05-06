@@ -58,6 +58,13 @@ MAX_NOTIONAL_MULTIPLE_OF_BALANCE = float(os.getenv("MAX_NOTIONAL_MULTIPLE_OF_BAL
 MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.30"))
 ALLOW_ALERT_RISK_PCT = os.getenv("ALLOW_ALERT_RISK_PCT", "false").lower() == "true"
 
+# Reconciliation / manual override protection.
+# AUTO_RECONCILE_ON_WEBHOOK lets the bot clear stale local state when MEXC is already flat.
+# MANUAL_OVERRIDE_POLICY=PAUSE_ON_DIFFERENCE prevents the bot from overwriting manual TP/SL edits made on MEXC.
+AUTO_RECONCILE_ON_WEBHOOK = os.getenv("AUTO_RECONCILE_ON_WEBHOOK", "true").lower() == "true"
+MANUAL_OVERRIDE_POLICY = os.getenv("MANUAL_OVERRIDE_POLICY", "PAUSE_ON_DIFFERENCE").upper()
+MANUAL_OVERRIDE_PRICE_TOLERANCE = float(os.getenv("MANUAL_OVERRIDE_PRICE_TOLERANCE", "0.5"))
+
 MEXC_CONTRACT_SIZE = float(os.getenv("MEXC_CONTRACT_SIZE", "0.0001"))
 MEXC_MIN_CONTRACT_VOL = int(os.getenv("MEXC_MIN_CONTRACT_VOL", "1"))
 
@@ -107,6 +114,21 @@ paper_state = {
     "updated_at_utc": None,
     "event_count": 0,
 }
+
+
+def reset_paper_state(reason: str = "paper state reset"):
+    paper_state.update({
+        "position": "flat",
+        "entry": None,
+        "stop": None,
+        "target": None,
+        "qty": None,
+        "last_action": "RESET",
+        "last_reason": reason,
+        "updated_at_utc": utc_now(),
+        "event_count": 0,
+    })
+    return paper_state.copy()
 
 
 # =====================================================
@@ -731,6 +753,93 @@ def stop_orders_for_position(mexc_result: dict, position_id):
             matched.append(order)
 
     return matched
+
+
+def _float_or_none(value):
+    if value in [None, "", "null"]:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _prices_differ(saved_value, mexc_value, tolerance: float):
+    saved = _float_or_none(saved_value)
+    mexc = _float_or_none(mexc_value)
+
+    if saved is None or mexc is None:
+        return False
+
+    return abs(saved - mexc) > tolerance
+
+
+def detect_manual_sltp_override(live_state: dict, matched_stop_orders: list):
+    """
+    Detect whether current MEXC SL/TP differs from backend-saved SL/TP.
+
+    This is intentionally conservative: only detects differences when a matching
+    stop order exists and both saved and MEXC values are readable numbers.
+    """
+    result = {
+        "checked": True,
+        "detected": False,
+        "policy": MANUAL_OVERRIDE_POLICY,
+        "price_tolerance": MANUAL_OVERRIDE_PRICE_TOLERANCE,
+        "differences": [],
+        "mexc_stop_order": None,
+    }
+
+    if MANUAL_OVERRIDE_POLICY != "PAUSE_ON_DIFFERENCE":
+        result["checked"] = False
+        result["reason"] = f"manual override policy {MANUAL_OVERRIDE_POLICY} does not require difference check"
+        return result
+
+    if not matched_stop_orders:
+        result["reason"] = "no matching stop orders available for comparison"
+        return result
+
+    # Prefer the first active matching TP/SL plan.
+    order = matched_stop_orders[0]
+    result["mexc_stop_order"] = order
+
+    saved_stop = live_state.get("currentStop")
+    saved_target = live_state.get("currentTarget")
+    mexc_stop = order.get("stopLossPrice")
+    mexc_target = order.get("takeProfitPrice")
+
+    if _prices_differ(saved_stop, mexc_stop, MANUAL_OVERRIDE_PRICE_TOLERANCE):
+        result["differences"].append({
+            "field": "stopLossPrice",
+            "backend_saved": saved_stop,
+            "mexc_current": mexc_stop,
+        })
+
+    if _prices_differ(saved_target, mexc_target, MANUAL_OVERRIDE_PRICE_TOLERANCE):
+        result["differences"].append({
+            "field": "takeProfitPrice",
+            "backend_saved": saved_target,
+            "mexc_current": mexc_target,
+        })
+
+    result["detected"] = len(result["differences"]) > 0
+    result["reason"] = "manual SL/TP difference detected" if result["detected"] else "no manual SL/TP difference detected"
+    return result
+
+
+def mark_manual_management_mode(live_state: dict, position=None, matched_stop_orders=None, manual_override=None, reason=None):
+    state_after = save_live_state({
+        **live_state,
+        "status": "MANUAL_MANAGEMENT_MODE",
+        "manualOverridePolicy": MANUAL_OVERRIDE_POLICY,
+        "manualOverrideDetectedAtUtc": utc_now(),
+        "manualOverride": manual_override or {},
+        "position": position if position is not None else live_state.get("position"),
+        "matched_stop_orders": matched_stop_orders if matched_stop_orders is not None else live_state.get("matched_stop_orders", []),
+        "reason": reason or "manual TP/SL difference detected; automation paused for this trade",
+        "danger": "Manual override detected. Bot will not modify or close this trade automatically. Manage it manually on MEXC.",
+    })
+    return state_after
 
 
 # =====================================================
@@ -1392,6 +1501,27 @@ def trail_update_workflow(payload: dict):
     stop_orders_snapshot_before = get_mexc_open_stop_orders(MEXC_CONTRACT_SYMBOL, position_id=position_id)
     matched_stop_orders_before = stop_orders_for_position(stop_orders_snapshot_before, position_id)
 
+    manual_override = detect_manual_sltp_override(live_state, matched_stop_orders_before)
+    if manual_override.get("detected"):
+        state_after = mark_manual_management_mode(
+            live_state,
+            position=matched_position,
+            matched_stop_orders=matched_stop_orders_before,
+            manual_override=manual_override,
+            reason="trail update blocked because manual MEXC TP/SL edit was detected",
+        )
+        return {
+            "status": "blocked",
+            "reason": "manual TP/SL override detected; bot will not overwrite MEXC settings",
+            "manual_override": manual_override,
+            "live_state_before": live_state,
+            "state_after": state_after,
+            "position": matched_position,
+            "stop_orders_snapshot_before": stop_orders_snapshot_before,
+            "matched_stop_orders_before": matched_stop_orders_before,
+            "danger": "Manual management mode. Manage this trade manually on MEXC.",
+        }
+
     stop_plan_order_id = get_stop_plan_order_id_from_orders(matched_stop_orders_before)
 
     if stop_plan_order_id is None:
@@ -1581,6 +1711,14 @@ def exit_workflow(payload: dict):
     base_action = validated["base_action"]
 
     live_state = load_live_state()
+
+    if live_state.get("status") == "MANUAL_MANAGEMENT_MODE":
+        return {
+            "status": "blocked",
+            "reason": "manual management mode is active; bot will not close this trade automatically",
+            "live_state": live_state,
+            "danger": "Manage/close this trade manually on MEXC. After MEXC is flat, the next webhook will auto-reconcile state.",
+        }
 
     if live_state.get("status") in ["EMPTY", None]:
         position_snapshot = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
@@ -2063,6 +2201,128 @@ def reconcile_live_state_workflow(clear_if_flat: bool = True):
     }
 
 
+
+
+def auto_reconcile_on_webhook_workflow(payload: dict = None):
+    """
+    Runs at the start of each accepted TradingView webhook.
+
+    Goals:
+    - If local state says a trade is open but MEXC is flat, clear local state automatically.
+    - If MEXC TP/SL has been manually changed, pause automation for this trade.
+    - Do not open/close/modify positions here; this only reconciles state and detects manual overrides.
+    """
+    if not AUTO_RECONCILE_ON_WEBHOOK:
+        return {
+            "checked": False,
+            "reason": "AUTO_RECONCILE_ON_WEBHOOK=false",
+        }
+
+    live_state = load_live_state()
+    position_snapshot = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+
+    if not position_snapshot.get("ok"):
+        return {
+            "checked": True,
+            "status": "error",
+            "reason": "could not read MEXC open positions during auto reconcile",
+            "live_state_before": live_state,
+            "position_snapshot": position_snapshot,
+        }
+
+    open_positions = get_open_positions_for_symbol(position_snapshot, MEXC_CONTRACT_SYMBOL)
+    state_status = live_state.get("status")
+    saved_position_id = live_state.get("positionId")
+
+    # MEXC flat: clear stale local/paper state so the next valid entry can proceed.
+    if not open_positions:
+        if state_status not in ["EMPTY", None]:
+            state_after = clear_live_state("auto reconcile on webhook: MEXC is flat; local state cleared")
+            paper_after = reset_paper_state("auto reconcile on webhook: MEXC is flat")
+            return {
+                "checked": True,
+                "status": "MEXC_FLAT_STATE_CLEARED",
+                "reason": "MEXC is flat, so stale local state was cleared",
+                "live_state_before": live_state,
+                "state_after": state_after,
+                "paper_state_after": paper_after,
+                "position_snapshot": position_snapshot,
+            }
+
+        return {
+            "checked": True,
+            "status": "ALREADY_EMPTY_AND_MEXC_FLAT",
+            "reason": "local state empty and MEXC flat",
+            "live_state_before": live_state,
+            "position_snapshot": position_snapshot,
+        }
+
+    # MEXC has an open position but the backend has no matching local state.
+    # Do not clear or take control automatically. Existing entry guards will block new entries.
+    if state_status in ["EMPTY", None]:
+        return {
+            "checked": True,
+            "status": "MEXC_OPEN_LOCAL_EMPTY",
+            "reason": "MEXC has an open position but local live state is empty; manual inspection required",
+            "open_positions": open_positions,
+            "live_state_before": live_state,
+            "position_snapshot": position_snapshot,
+        }
+
+    matched_position = None
+    if saved_position_id not in [None, "", 0, "0"]:
+        matched_position = find_open_position_by_position_id(position_snapshot, saved_position_id)
+
+    if matched_position is None and len(open_positions) == 1:
+        matched_position = open_positions[0]
+
+    if matched_position is None:
+        return {
+            "checked": True,
+            "status": "AMBIGUOUS_OPEN_POSITION",
+            "reason": "MEXC has open position(s), but none clearly match local state",
+            "open_positions": open_positions,
+            "live_state_before": live_state,
+            "position_snapshot": position_snapshot,
+        }
+
+    position_id = extract_position_id(matched_position)
+    stop_orders_snapshot = get_mexc_open_stop_orders(MEXC_CONTRACT_SYMBOL, position_id=position_id)
+    matched_stop_orders = stop_orders_for_position(stop_orders_snapshot, position_id)
+
+    if state_status in ["OPEN_WITH_SLTP_PLACED", "OPEN_WITH_SLTP_UPDATED"]:
+        manual_override = detect_manual_sltp_override(live_state, matched_stop_orders)
+        if manual_override.get("detected"):
+            state_after = mark_manual_management_mode(
+                live_state,
+                position=matched_position,
+                matched_stop_orders=matched_stop_orders,
+                manual_override=manual_override,
+                reason="auto reconcile on webhook detected manual MEXC TP/SL edit",
+            )
+            return {
+                "checked": True,
+                "status": "MANUAL_OVERRIDE_DETECTED",
+                "reason": "manual MEXC TP/SL edit detected; automation paused for this trade",
+                "manual_override": manual_override,
+                "live_state_before": live_state,
+                "state_after": state_after,
+                "position": matched_position,
+                "stop_orders_snapshot": stop_orders_snapshot,
+                "matched_stop_orders": matched_stop_orders,
+            }
+
+    return {
+        "checked": True,
+        "status": "MEXC_OPEN_STATE_OK",
+        "reason": "MEXC open position matches local state; no manual override detected",
+        "live_state_before": live_state,
+        "position": matched_position,
+        "positionId": position_id,
+        "matched_stop_orders": matched_stop_orders,
+    }
+
+
 # =====================================================
 # Routes
 # =====================================================
@@ -2100,6 +2360,9 @@ def health_check():
         "max_notional_multiple_of_balance": MAX_NOTIONAL_MULTIPLE_OF_BALANCE,
         "min_stop_distance_pct": MIN_STOP_DISTANCE_PCT,
         "allow_alert_risk_pct": ALLOW_ALERT_RISK_PCT,
+        "auto_reconcile_on_webhook": AUTO_RECONCILE_ON_WEBHOOK,
+        "manual_override_policy": MANUAL_OVERRIDE_POLICY,
+        "manual_override_price_tolerance": MANUAL_OVERRIDE_PRICE_TOLERANCE,
         "backend_sizing_dry_run_available": True,
         "max_order_vol_removed": True,
         "position_size_caps": "risk_pct + dynamic_size_cap_multiplier + max_notional_multiple_of_balance + min_stop_distance_pct",
@@ -2196,17 +2459,7 @@ def reset_state(request: Request):
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    paper_state.update({
-        "position": "flat",
-        "entry": None,
-        "stop": None,
-        "target": None,
-        "qty": None,
-        "last_action": "RESET",
-        "last_reason": "paper state manually reset",
-        "updated_at_utc": utc_now(),
-        "event_count": 0,
-    })
+    reset_paper_state("paper state manually reset")
 
     live_state = clear_live_state("manual reset")
 
@@ -3005,9 +3258,14 @@ async def tradingview_webhook(request: Request):
     }
 
     workflow_result = None
+    auto_reconcile_result = {
+        "checked": False,
+        "reason": "webhook not accepted yet",
+    }
 
     if accepted:
         base_action = clean_action(action)
+        auto_reconcile_result = auto_reconcile_on_webhook_workflow(payload)
 
         # -----------------------------
         # Entry signals
@@ -3153,6 +3411,7 @@ async def tradingview_webhook(request: Request):
         "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
         "payload": payload,
         "entry_guard": entry_guard,
+        "auto_reconcile_result": auto_reconcile_result,
         "workflow_result": workflow_result,
         "paper_result": paper_result,
         "mexc_position_snapshot": mexc_position_snapshot,
@@ -3169,6 +3428,7 @@ async def tradingview_webhook(request: Request):
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
         "entry_guard": entry_guard,
+        "auto_reconcile_result": auto_reconcile_result,
         "workflow_result": workflow_result,
         "paper_result": paper_result,
         "mexc_position_snapshot": mexc_position_snapshot,
