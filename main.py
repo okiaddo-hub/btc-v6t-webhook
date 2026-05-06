@@ -781,6 +781,7 @@ def change_plan_price_only_if_armed(change_body: dict):
         "change_sent": True,
         "reason": f"LIVE_TRADING_ENABLED=true - modifying TP/SL via {MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH}",
         "mexc_stop_order_change_plan_price_path": MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH,
+        "exit_confirm_phrase_required": "I_UNDERSTAND_THIS_CLOSES_LIVE_POSITION",
         "mexc_response": mexc_post_private(MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH, change_body),
     }
 
@@ -1105,6 +1106,213 @@ def trail_update_workflow(payload: dict):
     }
 
 
+
+def validate_exit_payload(payload: dict):
+    """
+    Validates LONG_EXIT / SHORT_EXIT payloads.
+
+    TradingView exit alerts may send stop/target/qty as null.
+    The backend closes based on the actual MEXC open position, not the alert qty.
+    """
+    action = payload.get("action")
+    base_action = clean_action(action)
+
+    if base_action not in {"LONG_EXIT", "SHORT_EXIT"}:
+        raise ValueError(f"Cannot validate non-exit action: {action}")
+
+    price_raw = payload.get("price")
+    price = None if price_raw in [None, "", "null"] else to_float(price_raw, "price")
+
+    if price is not None and price <= 0:
+        raise ValueError(f"price must be > 0 when provided, got {price}")
+
+    return {
+        "price": price,
+        "base_action": base_action,
+    }
+
+
+def close_side_for_state_side(state_side: str):
+    """
+    MEXC futures side codes:
+    2 = close short
+    4 = close long
+    """
+    if state_side == "LONG":
+        return 4
+    if state_side == "SHORT":
+        return 2
+    raise ValueError(f"Unsupported state side for close: {state_side}")
+
+
+def build_mexc_close_order_from_position(position: dict, state_side: str):
+    """
+    Builds a market close order for the current MEXC position.
+
+    Uses the actual MEXC holdVol, not the TradingView alert qty.
+    In one-way mode, reduceOnly=true is included as an additional safety flag.
+    """
+    position_id = extract_position_id(position)
+    hold_vol = extract_hold_vol(position)
+
+    if position_id in [None, "", 0, "0"]:
+        raise ValueError("Cannot close: positionId missing from MEXC position")
+
+    if hold_vol is None or hold_vol <= 0:
+        raise ValueError(f"Cannot close: invalid holdVol {hold_vol}")
+
+    # BTC_USDT uses integer contract volume.
+    close_vol = int(round(float(hold_vol)))
+
+    if close_vol < MEXC_MIN_CONTRACT_VOL:
+        raise ValueError(f"Cannot close: close_vol {close_vol} below minimum {MEXC_MIN_CONTRACT_VOL}")
+
+    body = {
+        "symbol": MEXC_CONTRACT_SYMBOL,
+        "price": 0,
+        "vol": close_vol,
+        "leverage": MEXC_LEVERAGE,
+        "side": close_side_for_state_side(state_side),
+        "type": MEXC_ORDER_TYPE,
+        "openType": MEXC_OPEN_TYPE,
+        "externalOid": short_external_oid(),
+        "positionMode": MEXC_POSITION_MODE,
+        "positionId": int(position_id),
+        "reduceOnly": True,
+    }
+
+    return body
+
+
+def close_position_only_if_armed(close_body: dict):
+    if not LIVE_TRADING_ENABLED:
+        return {
+            "close_order_sent": False,
+            "reason": "blocked - LIVE_TRADING_ENABLED=false",
+            "would_send_close_order": close_body,
+        }
+
+    return {
+        "close_order_sent": True,
+        "reason": f"LIVE_TRADING_ENABLED=true - submitting close order to MEXC path {MEXC_ORDER_CREATE_PATH}",
+        "mexc_order_path": MEXC_ORDER_CREATE_PATH,
+        "mexc_response": mexc_post_private(MEXC_ORDER_CREATE_PATH, close_body),
+    }
+
+
+def exit_workflow(payload: dict):
+    """
+    Live exit/reconciliation workflow:
+    1. validate exit action
+    2. read local live state
+    3. confirm action matches live state side
+    4. check MEXC open position
+    5. if already flat: clear state
+    6. if open: submit market close order
+    7. verify MEXC is flat
+    8. clear or mark state based on result
+    """
+    validated = validate_exit_payload(payload)
+    base_action = validated["base_action"]
+
+    live_state = load_live_state()
+
+    if live_state.get("status") in ["EMPTY", None]:
+        position_snapshot = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+        has_position, mexc_reason = has_open_mexc_position(position_snapshot)
+        if not has_position:
+            state_after = clear_live_state("exit received but local state and MEXC are already flat")
+            return {
+                "status": "ALREADY_FLAT",
+                "reason": "Local state empty and MEXC has no open position.",
+                "position_snapshot": position_snapshot,
+                "state_after": state_after,
+            }
+        return {
+            "status": "blocked",
+            "reason": "Local state is empty but MEXC has an open position. Reconcile manually before closing via webhook.",
+            "position_snapshot": position_snapshot,
+            "mexc_reason": mexc_reason,
+            "danger": "Manual inspection required before sending close order.",
+        }
+
+    state_side = live_state.get("side")
+    expected_action = "LONG_EXIT" if state_side == "LONG" else "SHORT_EXIT" if state_side == "SHORT" else None
+
+    if expected_action is None or base_action != expected_action:
+        return {
+            "status": "blocked",
+            "reason": f"exit action {base_action} does not match live state side {state_side}",
+            "live_state": live_state,
+        }
+
+    position_id = live_state.get("positionId")
+    position_snapshot_before = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+    matched_position = None
+
+    if position_id not in [None, "", 0, "0"]:
+        matched_position = find_open_position_by_position_id(position_snapshot_before, position_id)
+
+    if matched_position is None:
+        # MEXC is already flat for the saved position. Clear local state.
+        state_after = clear_live_state("exit reconciliation: saved position is already closed on MEXC")
+        stop_orders_snapshot = get_mexc_open_stop_orders(MEXC_CONTRACT_SYMBOL, position_id=position_id)
+        return {
+            "status": "ALREADY_CLOSED_ON_MEXC",
+            "reason": "Saved positionId not found in open positions; local state cleared.",
+            "position_snapshot_before": position_snapshot_before,
+            "stop_orders_snapshot": stop_orders_snapshot,
+            "state_after": state_after,
+        }
+
+    close_body = build_mexc_close_order_from_position(matched_position, state_side)
+    close_result = close_position_only_if_armed(close_body)
+    close_success = mexc_success(close_result.get("mexc_response", {}))
+
+    time.sleep(1.0)
+
+    position_snapshot_after = get_mexc_open_positions(MEXC_CONTRACT_SYMBOL)
+    matched_position_after = find_open_position_by_position_id(position_snapshot_after, position_id)
+    stop_orders_snapshot_after = get_mexc_open_stop_orders(MEXC_CONTRACT_SYMBOL, position_id=position_id)
+
+    if close_success and matched_position_after is None:
+        state_after = clear_live_state("exit workflow: close order succeeded and MEXC is flat")
+        final_status = "CLOSED_AND_STATE_CLEARED"
+        danger = None
+    else:
+        state_after = save_live_state({
+            **live_state,
+            "status": "EXIT_SUBMITTED_BUT_POSITION_STILL_OPEN" if close_success else "EXIT_FAILED",
+            "lastExitAttempt": {
+                "action": base_action,
+                "price": validated["price"],
+                "close_body": close_body,
+                "close_success": close_success,
+                "updated_at_utc": utc_now(),
+            },
+            "position_snapshot_after": position_snapshot_after,
+            "stop_orders_snapshot_after": stop_orders_snapshot_after,
+            "danger": "Close order failed or position still open. Check MEXC immediately.",
+        })
+        final_status = state_after.get("status")
+        danger = "Close order failed or position still open. Check MEXC immediately."
+
+    return {
+        "status": final_status,
+        "live_state_before": live_state,
+        "position_before": matched_position,
+        "positionId": position_id,
+        "close_body": close_body,
+        "close_result": close_result,
+        "position_snapshot_before": position_snapshot_before,
+        "position_snapshot_after": position_snapshot_after,
+        "matched_position_after": matched_position_after,
+        "stop_orders_snapshot_after": stop_orders_snapshot_after,
+        "state_after": state_after,
+        "danger": danger,
+    }
+
+
 # =====================================================
 # Entry guard
 # =====================================================
@@ -1345,6 +1553,7 @@ def process_paper_event(payload: dict, is_test: bool):
 
 CLEAR_LIVE_STATE_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_CLEARS_LIVE_STATE"
 TRAIL_UPDATE_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_MODIFIES_LIVE_SLTP"
+EXIT_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_CLOSES_LIVE_POSITION"
 
 
 def find_open_position_by_position_id(mexc_result: dict, position_id):
@@ -1506,6 +1715,7 @@ def health_check():
         "mexc_order_create_path": MEXC_ORDER_CREATE_PATH,
         "mexc_stop_order_place_path": MEXC_STOP_ORDER_PLACE_PATH,
         "mexc_stop_order_change_plan_price_path": MEXC_STOP_ORDER_CHANGE_PLAN_PRICE_PATH,
+        "exit_confirm_phrase_required": "I_UNDERSTAND_THIS_CLOSES_LIVE_POSITION",
         "mexc_contract_size": MEXC_CONTRACT_SIZE,
         "mexc_min_contract_vol": MEXC_MIN_CONTRACT_VOL,
         "mexc_leverage": MEXC_LEVERAGE,
@@ -1816,6 +2026,75 @@ def manual_trail_update_test(request: Request):
         "status": "ok" if str(result.get("status", "")).endswith("UPDATED") else result.get("status", "unknown"),
         "payload": payload,
         "trail_update_result": result,
+    }
+
+
+@app.get("/manual-exit-test")
+def manual_exit_test(request: Request):
+    """
+    Controlled one-off live exit test.
+
+    Required query params:
+    - secret
+    - side=long or short
+    - price=current/reference price, optional but recommended
+    - confirm=I_UNDERSTAND_THIS_CLOSES_LIVE_POSITION
+    """
+    secret = request.query_params.get("secret")
+    side = request.query_params.get("side", "").lower()
+    confirm = request.query_params.get("confirm")
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    if confirm != EXIT_CONFIRM_PHRASE:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing or incorrect confirmation phrase. Use confirm=I_UNDERSTAND_THIS_CLOSES_LIVE_POSITION"
+        )
+
+    if side not in {"long", "short"}:
+        raise HTTPException(status_code=400, detail="side must be long or short")
+
+    if not LIVE_TRADING_ENABLED:
+        return {
+            "status": "blocked",
+            "reason": "LIVE_TRADING_ENABLED=false",
+            "live_order_sent": False,
+        }
+
+    price_raw = request.query_params.get("price")
+    price = None if price_raw in [None, "", "null"] else to_float(price_raw, "price")
+
+    action = "LONG_EXIT" if side == "long" else "SHORT_EXIT"
+
+    payload = {
+        "symbol": EXPECTED_SYMBOL,
+        "action": action,
+        "side": side.upper(),
+        "price": price,
+        "stop": None,
+        "target": None,
+        "qty": None,
+        "time": None,
+        "timeframe": EXPECTED_TIMEFRAME,
+    }
+
+    workflow_result = exit_workflow(payload)
+
+    event = {
+        "event": "manual_exit_test",
+        "received_at_utc": utc_now(),
+        "payload": payload,
+        "workflow_result": workflow_result,
+    }
+    print(json.dumps(event))
+
+    return {
+        "status": "ok",
+        "payload": payload,
+        "workflow_result": workflow_result,
+        "critical_next_step": "Check MEXC immediately. Confirm position is closed and no leftover SL/TP remains.",
     }
 
 
@@ -2154,17 +2433,42 @@ async def tradingview_webhook(request: Request):
                     }
 
         # -----------------------------
-        # Exit signals - accepted, but not live-wired yet
+        # Exit signals
         # -----------------------------
         elif base_action in {"LONG_EXIT", "SHORT_EXIT"}:
-            workflow_result = {
-                "live_order_sent": False,
-                "reason": "Exit webhook accepted, but live exit/reconciliation execution is not implemented yet.",
-                "live_trading_enabled": LIVE_TRADING_ENABLED,
-                "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
-                "next_development_step": "Implement close/reconcile/cancel-leftover-SLTP workflow before enabling exits.",
-                "live_state": load_live_state(),
-            }
+            if is_test:
+                workflow_result = {
+                    "close_order_sent": False,
+                    "reason": "TEST exit received; live close intentionally blocked.",
+                    "live_trading_enabled": LIVE_TRADING_ENABLED,
+                    "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
+                    "live_state": load_live_state(),
+                }
+
+            elif LIVE_TRADING_ENABLED and AUTO_TV_EXECUTION_ENABLED:
+                workflow_result = exit_workflow(payload)
+
+            else:
+                try:
+                    validated = validate_exit_payload(payload)
+                    workflow_result = {
+                        "close_order_sent": False,
+                        "reason": "TradingView auto execution disabled. No live close order submitted.",
+                        "live_trading_enabled": LIVE_TRADING_ENABLED,
+                        "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
+                        "would_close": {
+                            "action": validated["base_action"],
+                            "price": validated["price"],
+                            "path": MEXC_ORDER_CREATE_PATH,
+                            "note": "Actual close volume is read from MEXC open position, not TradingView qty.",
+                        },
+                        "live_state": load_live_state(),
+                    }
+                except Exception as e:
+                    workflow_result = {
+                        "close_order_sent": False,
+                        "reason": f"failed to validate proposed exit: {str(e)}",
+                    }
 
         paper_result = process_paper_event(payload, is_test)
 
