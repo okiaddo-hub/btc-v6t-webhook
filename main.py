@@ -535,17 +535,35 @@ def calculate_backend_position_size(price: float, stop: float, risk_pct: float =
             **result_common,
         }
 
-    mexc_vol = btc_qty_to_mexc_vol(final_uncorrected_qty_btc)
+    # Convert BTC qty into integer MEXC contracts.
+    # For backend risk sizing, floor rather than round.
+    # Reason: rounding up can create slightly more risk than intended.
+    # Flooring produces the nearest valid MEXC contract size at or below the target risk size.
+    mexc_vol = int(final_uncorrected_qty_btc / MEXC_CONTRACT_SIZE)
+
+    if mexc_vol < MEXC_MIN_CONTRACT_VOL:
+        return {
+            "ok": False,
+            "reason": f"Calculated MEXC vol {mexc_vol} is below minimum {MEXC_MIN_CONTRACT_VOL} after contract flooring",
+            **result_common,
+            "mexc_contract_size": MEXC_CONTRACT_SIZE,
+            "mexc_vol_contracts": mexc_vol,
+            "contract_rounding_mode": "floor_to_avoid_exceeding_risk",
+        }
+
     final_qty_btc = mexc_vol * MEXC_CONTRACT_SIZE
+    contract_rounding_difference_btc = final_uncorrected_qty_btc - final_qty_btc
 
     if final_qty_btc > dynamic_cap_qty_btc * 1.000001:
         return {
             "ok": False,
-            "reason": "Final rounded quantity exceeds dynamic risk cap after contract conversion",
+            "reason": "Final contract quantity exceeds dynamic risk cap after contract conversion",
             **result_common,
             "final_qty_btc": final_qty_btc,
             "mexc_contract_size": MEXC_CONTRACT_SIZE,
             "mexc_vol_contracts": mexc_vol,
+            "contract_rounding_mode": "floor_to_avoid_exceeding_risk",
+            "contract_rounding_difference_btc": contract_rounding_difference_btc,
         }
 
     return {
@@ -554,7 +572,9 @@ def calculate_backend_position_size(price: float, stop: float, risk_pct: float =
         "final_qty_btc": final_qty_btc,
         "mexc_contract_size": MEXC_CONTRACT_SIZE,
         "mexc_vol_contracts": mexc_vol,
-        "note": "Backend balance sizing uses dynamic risk-aware caps that scale with balance, risk %, stop distance, price, and leverage.",
+        "contract_rounding_mode": "floor_to_avoid_exceeding_risk",
+        "contract_rounding_difference_btc": contract_rounding_difference_btc,
+        "note": "Backend balance sizing uses dynamic risk-aware caps that scale with balance, risk %, stop distance, price, and leverage. Contract conversion floors to the nearest valid MEXC contract size to avoid exceeding intended risk.",
     }
 
 
