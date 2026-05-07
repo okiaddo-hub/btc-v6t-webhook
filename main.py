@@ -2335,11 +2335,47 @@ def auto_reconcile_on_webhook_workflow(payload: dict = None):
 
 
 # =====================================================
+# Route security helpers
+# =====================================================
+
+def require_webhook_secret(request: Request):
+    secret = request.query_params.get("secret")
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    return True
+
+
+# =====================================================
 # Routes
 # =====================================================
 
 @app.get("/")
-def health_check():
+def public_health_check():
+    """
+    Minimal public health endpoint.
+
+    This route intentionally avoids exposing configuration details because public VPS
+    services are routinely scanned for secrets and operational metadata.
+    """
+    return {
+        "status": "ok",
+        "service": "btc-v6t-webhook-receiver",
+        "message": "Receiver is running",
+    }
+
+
+@app.get("/health")
+def health_alias():
+    """Minimal public health alias."""
+    return {
+        "status": "ok",
+        "service": "btc-v6t-webhook-receiver",
+    }
+
+
+@app.get("/admin-health")
+def admin_health_check(request: Request):
+    require_webhook_secret(request)
     return {
         "status": "ok",
         "service": "btc-v6t-webhook-receiver",
@@ -2386,7 +2422,8 @@ def health_check():
 
 
 @app.get("/state")
-def get_state():
+def get_state(request: Request):
+    require_webhook_secret(request)
     return {
         "status": "ok",
         "paper_state": paper_state,
