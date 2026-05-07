@@ -24,6 +24,7 @@ MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
 
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
 AUTO_TV_EXECUTION_ENABLED = os.getenv("AUTO_TV_EXECUTION_ENABLED", "false").lower() == "true"
+ENABLE_PAPER_STATE = os.getenv("ENABLE_PAPER_STATE", "false").lower() == "true"
 
 MEXC_CONTRACT_SYMBOL = os.getenv("MEXC_CONTRACT_SYMBOL", "BTC_USDT")
 MEXC_CONTRACT_BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://api.mexc.com")
@@ -1858,7 +1859,7 @@ def run_entry_guard(payload: dict, is_test: bool, mexc_position_snapshot=None):
         })
         return result
 
-    if paper_state["position"] != "flat":
+    if ENABLE_PAPER_STATE and paper_state["position"] != "flat":
         result.update({
             "guard_passed": False,
             "would_enter": False,
@@ -1928,6 +1929,16 @@ def process_paper_event(payload: dict, is_test: bool):
     qty = payload.get("qty")
 
     paper_state["event_count"] += 1
+
+    if not ENABLE_PAPER_STATE:
+        paper_state["last_action"] = action
+        paper_state["last_reason"] = "paper state disabled; no paper position update"
+        paper_state["updated_at_utc"] = utc_now()
+        return {
+            "paper_accepted": False,
+            "paper_reason": "paper state disabled; no paper position update",
+            "paper_state": paper_state.copy(),
+        }
 
     if is_test:
         paper_state["last_action"] = action
@@ -2335,6 +2346,7 @@ def health_check():
         "message": "Receiver is running",
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
+        "enable_paper_state": ENABLE_PAPER_STATE,
         "mexc_contract_symbol": MEXC_CONTRACT_SYMBOL,
         "mexc_base_url": MEXC_CONTRACT_BASE_URL,
         "mexc_order_create_path": MEXC_ORDER_CREATE_PATH,
@@ -2381,6 +2393,7 @@ def get_state():
         "live_state": load_live_state(),
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "auto_tv_execution_enabled": AUTO_TV_EXECUTION_ENABLED,
+        "enable_paper_state": ENABLE_PAPER_STATE,
     }
 
 
