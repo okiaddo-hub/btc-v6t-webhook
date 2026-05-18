@@ -68,6 +68,7 @@ MANUAL_OVERRIDE_PRICE_TOLERANCE = float(os.getenv("MANUAL_OVERRIDE_PRICE_TOLERAN
 
 MEXC_CONTRACT_SIZE = float(os.getenv("MEXC_CONTRACT_SIZE", "0.0001"))
 MEXC_MIN_CONTRACT_VOL = int(os.getenv("MEXC_MIN_CONTRACT_VOL", "1"))
+MEXC_PRICE_DECIMALS = int(os.getenv("MEXC_PRICE_DECIMALS", "1"))
 
 MIN_ORDER_VOL = float(os.getenv("MIN_ORDER_VOL", "0.0001"))        # BTC qty
 MAX_MANUAL_TEST_VOL = float(os.getenv("MAX_MANUAL_TEST_VOL", "0.001"))
@@ -152,6 +153,20 @@ def to_float(value, field_name: str):
     except Exception:
         raise ValueError(f"{field_name} must be numeric, got {value}")
 
+def round_mexc_price(price):
+    """
+    Round MEXC futures trigger prices to the configured decimal precision.
+
+    BTC_USDT stop/take-profit orders rejected long decimal prices with:
+    code 2015: Price or quantity precision error.
+
+    Default: 1 decimal place.
+    Override with MEXC_PRICE_DECIMALS in .env if needed.
+    """
+    if price in [None, "", "null"]:
+        return None
+
+    return round(float(price), MEXC_PRICE_DECIMALS)
 
 def btc_qty_to_mexc_vol(qty_btc: float):
     raw_vol = qty_btc / MEXC_CONTRACT_SIZE
@@ -1003,7 +1018,6 @@ def build_mexc_attached_sltp_entry_order(payload: dict):
     ]
     return proposed
 
-
 def build_position_sltp_order(position_id, mexc_vol: int, stop: float, target: float):
     """
     Builds MEXC TP/SL order by existing position.
@@ -1015,13 +1029,16 @@ def build_position_sltp_order(position_id, mexc_vol: int, stop: float, target: f
     Uses SAME quantity for TP and SL:
     profitLossVolType = SAME
     """
+    rounded_stop = round_mexc_price(stop)
+    rounded_target = round_mexc_price(target)
+
     body = {
         "positionId": int(position_id),
         "vol": mexc_vol,
         "lossTrend": MEXC_SL_PRICE_TYPE,
         "profitTrend": MEXC_TP_PRICE_TYPE,
-        "stopLossPrice": stop,
-        "takeProfitPrice": target,
+        "stopLossPrice": rounded_stop,
+        "takeProfitPrice": rounded_target,
         "priceProtect": MEXC_PRICE_PROTECT,
         "profitLossVolType": "SAME",
         "volType": 1,
@@ -1080,12 +1097,12 @@ def build_change_plan_price_order(stop_plan_order_id, stop: float = None, target
     if stop is not None:
         if float(stop) <= 0:
             raise ValueError("stopLossPrice must be > 0")
-        body["stopLossPrice"] = float(stop)
+        body["stopLossPrice"] = round_mexc_price(stop)
 
     if target is not None:
         if float(target) <= 0:
             raise ValueError("takeProfitPrice must be > 0")
-        body["takeProfitPrice"] = float(target)
+        body["takeProfitPrice"] = round_mexc_price(target)
 
     return body
 
